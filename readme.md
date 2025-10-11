@@ -77,7 +77,7 @@ extract_and_save_hidden_states(
     save_name = <YOUR SAVE NAME>, #path and file name to save generated texts
     tokenizer = tokenizer,
     model = model,
-    task_type = "reuse" #'reuse' is when you use LLM to regenerate texts and get hidden states
+    task_type = "repeat" #'repeat' is when you use LLM to regenerate texts and get hidden states
     # if you want to generate new texts, set task_type == "create"
     # You can specify any task by writing the task prompt and set task_type == <YOUR TASK>
 )

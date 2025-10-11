@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "gpi_pack"
 version = "0.1.1"
-description = "A brief description of your package"
+description = "The package of GenAI-Powered Inference"
 readme = "README.md"
 authors = [
     {name = "Kentaro Nakamura", email = "knakamura@g.harvard.edu"},

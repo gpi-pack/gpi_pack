@@ -43,3 +43,4 @@ Thumbs.db
 # Development directories
 test/development/
 test/.env
+development_memo.md
