@@ -522,7 +522,7 @@ def TarNet_loss(
             prob_control = y0_selected[torch.arange(y0_selected.size(0)), y_true_control]
             loss0 = -torch.log(prob_control + 1e-8).mean()
         else:
-            return("No control group observation founded! Please check the treatment assignment.")
+            loss0 = 0.0  # No control group observations; set loss0 to 0.
 
         if T1_indices.numel() > 0:
             y1_selected = y1_pred[T1_indices]           # (n_treated, num_classes)
@@ -530,17 +530,17 @@ def TarNet_loss(
             prob_treated = y1_selected[torch.arange(y1_selected.size(0)), y_true_treated]
             loss1 = -torch.log(prob_treated + 1e-8).mean()
         else:
-            return("No treatment group observation founded! Please check the treatment assignment.")
+            loss1 = 0.0  # No treatment group observations; set loss1 to 0.
     else:
         # Use Mean Squared Error loss.
         if T0_indices.numel() > 0:
             loss0 = ((y0_pred.view(-1) - y_true.view(-1))[T0_indices] ** 2).mean()
         else:
-            return("No control group observation founded! Please check the treatment assignment.")
+            loss0 = 0.0  # No control group observations; set loss0 to 0.
             
         if T1_indices.numel() > 0:
             loss1 = ((y1_pred.view(-1) - y_true.view(-1))[T1_indices] ** 2).mean()
         else:
-            return("No treatment group observation founded! Please check the treatment assignment.")
+            loss1 = 0.0  # No treatment group observations; set loss1 to 0.
 
     return loss0 + loss1

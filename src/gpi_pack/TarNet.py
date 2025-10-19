@@ -296,6 +296,7 @@ def estimate_k_ate(
         nepoch: int = 200,
         step_size: int = None,
         lr: float = 2e-5,
+        cluster: list = None,
         dropout: float = 0.2,
         architecture_y: list = [200, 1],
         architecture_z: list = [2048],
@@ -371,6 +372,9 @@ def estimate_k_ate(
 
     lr : float, default=2e-5
         Learning rate for TarNet.
+
+    cluster : list, optional
+        A list indicating cluster membership for each observation. If provided, clustered standard errors will be computed.
 
     dropout : float, default=0.2
         Dropout rate for TarNet layers.
@@ -507,7 +511,19 @@ def estimate_k_ate(
         psi_list.extend(psi)
 
     ate_est = np.mean(psi_list)
-    se_est = np.std(psi_list) / np.sqrt(len(psi_list))
+    if cluster is None:
+        se_est = np.std(psi_list) / np.sqrt(len(psi_list))
+    else:
+        #clustered standard error
+        cluster = np.array(cluster)
+        unique_clusters = np.unique(cluster)
+        m = len(unique_clusters)
+        cluster_sums = []
+        for uc in unique_clusters:
+            cluster_psi = np.array(psi_list)[cluster == uc]
+            cluster_sums.append(np.sum(cluster_psi - ate_est))
+        cluster_sums = np.array(cluster_sums)
+        se_est = np.sqrt(m / (m - 1) * np.sum(cluster_sums**2)) / len(psi_list)
 
     print("ATE:", ate_est, " /  SE:", se_est)
 
