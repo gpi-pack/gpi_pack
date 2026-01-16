@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import torch
+import torch.nn as nn
 from torch.utils.data import TensorDataset, DataLoader, RandomSampler, SequentialSampler
 import numpy as np
 from sklearn.model_selection import KFold, train_test_split
@@ -20,7 +21,7 @@ from .TNutil import (
     dml_score,
 )
 
-from typing import Union
+from typing import Union, Callable
 
 class TarNet:
     '''
@@ -51,6 +52,8 @@ class TarNet:
         learning_rate: float = 2e-5,
         architecture_y: list = [1],
         architecture_z: list = [1024],
+        conv_layers: list[dict] | None = None,
+        conv_activation: Callable[[], nn.Module] = nn.ReLU,
         dropout: float = 0.3,
         step_size: int = None,
         bn: bool = False,
@@ -69,6 +72,10 @@ class TarNet:
         - learning_rate: float, learning rate
         - architecture_y: list, architecture of the outcome model
         - architecture_z: list, architecture of the shared representation model
+        - conv_layers: list of convolutional layer specs applied before the shared representation.
+                   Example: [{"in_channels":3, "out_channels":32, "kernel_size":3, "padding":1, "pool":{"kernel_size":2}}].
+                   Leave as None when inputs are already flattened.
+        - conv_activation: callable returning an nn.Module activation for conv blocks (default: nn.ReLU)
         - dropout: float, dropout rate
         - step_size: int, step size for the learning rate scheduler (if None, no scheduler)
         - bn: bool, whether to use batch normalization
@@ -90,6 +97,8 @@ class TarNet:
             dropout=dropout,
             bn=bn,
             return_prob=self.return_probablity,
+            conv_layers=conv_layers,
+            conv_activation=conv_activation,
         ).to(self.device)
         self.optim = torch.optim.AdamW(self.model.parameters(), lr=learning_rate, eps=1e-8)
         self.step_size = step_size
@@ -302,6 +311,8 @@ def estimate_k_ate(
         dropout: float = 0.2,
         architecture_y: list = [200, 1],
         architecture_z: list = [2048],
+    conv_layers: list[dict] | None = None,
+    conv_activation: Callable[[], nn.Module] = nn.ReLU,
         trim: list = [0.01, 0.99],
         bn: bool = False,
         patience: int = 5,
@@ -388,6 +399,14 @@ def estimate_k_ate(
     architecture_z : list, default=[2048]
         List specifying the layer sizes for the deconfounder.
         For example, [2048, 2048] means that the deconfounder has two hidden layers, each with 2048 units.
+
+    conv_layers : list of dict, optional
+        Specification for convolutional layers applied directly to R when it represents image tensors (N, C, H, W).
+        Each dict should at least include `in_channels` (first layer only) and `out_channels`, plus optional Conv2d args
+        like `kernel_size`, `stride`, `padding`, and an optional `pool` dict (passed to MaxPool2d/AvgPool2d).
+
+    conv_activation : callable, optional
+        Factory returning the activation module inserted after each convolution (default: nn.ReLU).
 
     trim : list, default=[0.01, 0.99]
         Trimming bounds for the propensity score. 
@@ -493,22 +512,24 @@ def estimate_k_ate(
         model = TarNet(
             epochs= nepoch, learning_rate = lr, batch_size= batch_size,
             architecture_y = architecture_y, architecture_z = architecture_z, dropout=dropout,
+            conv_layers=conv_layers, conv_activation=conv_activation,
             step_size= step_size, bn=bn,
             patience= patience, min_delta= min_delta, model_dir=model_dir, verbose=verbose,
         )
         model.fit(R = r_train, Y = y_train, T = t_train, valid_perc = valid_perc)
         y0_pred, y1_pred, fr = model.predict(r_test)
 
+        ps_params = dict(ps_model_params)
         if ps_model == SpectralNormClassifier:
-            #Make sure to set the input_dim to the last layer of the shared representation
-            #when using the default ps_model (SpectralNormClassifier)
-            ps_model_params["input_dim"] = architecture_z[-1]
+            # Make sure to set the input_dim to the last layer of the shared representation
+            # when using the default ps_model (SpectralNormClassifier)
+            ps_params.setdefault("input_dim", architecture_z[-1])
 
         #train propensity score purely on test data (use two-fold cross fitting)
         psi, _ = estimate_psi_split(
             fr = fr, t = t_test, y = y_test, y0 = y0_pred, y1 = y1_pred,
             plot_propensity = plot_propensity, trim = trim,
-            ps_model= ps_model, ps_model_params= ps_model_params
+            ps_model= ps_model, ps_model_params= ps_params
         )
         psi_list.extend(psi)
 

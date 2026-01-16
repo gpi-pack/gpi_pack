@@ -16,7 +16,7 @@ from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score
 
 import matplotlib.pyplot as plt
-from typing import Union
+from typing import Union, Callable
 
 class TarNetBase(nn.Module):
     def __init__(self,
@@ -25,15 +25,20 @@ class TarNetBase(nn.Module):
             dropout: float=None,
             bn: bool = False,
             return_prob: bool = False,
+            conv_layers: list[dict] | None = None,
+            conv_activation: Callable[[], nn.Module] = nn.ReLU,
         ):
         '''
-        Class for TarNet model (PyTorch). First layer is Transformer architecture
+        Class for TarNet model (PyTorch) with optional convolutional front-end.
 
         Args:
             sizes_z: tuple, size of hidden layers for shared representation
             sizes_y: tuple, size of hidden layers for outcome prediction
-            input_dim: int, input dimension for lstm or transformer
-            hidden_dim: int, hidden dimension for lstm or transformer
+            conv_layers: optional list of convolutional layer specifications applied before
+                the shared representation. Each spec should include 'in_channels' (first layer only)
+                and 'out_channels', plus any Conv2d keyword arguments.
+            conv_activation: callable that returns an activation module for each conv block
+                (default: nn.ReLU). Set to None to skip activations.
             dropout: float, dropout rate (default: 0.3)
             bn: bool, whether to use batch normalization (default: False)
                 Note that after the first layer everything is the feedforward network.
@@ -45,11 +50,13 @@ class TarNetBase(nn.Module):
         '''
 
         super(TarNetBase, self).__init__()
-        self.bn: bool = bn
-        self.model_z = self._build_model(sizes_z, dropout) #model for shared representation
-        self.model_y1 = self._build_model(sizes_y, dropout) #model for Y(1)
-        self.model_y0 = self._build_model(sizes_y, dropout) #model for Y(0)
-        self.return_prob = return_prob #whether to return the predicted probabilities
+        self.bn = bn
+        self.return_prob = return_prob
+        self.conv_layers = self._build_conv(conv_layers or [], conv_activation)
+        self.flatten = nn.Flatten(start_dim=1)
+        self.model_z = self._build_model(sizes_z, dropout)
+        self.model_y1 = self._build_model([sizes_z[-1]] + sizes_y, dropout)
+        self.model_y0 = self._build_model([sizes_z[-1]] + sizes_y, dropout)
 
     def _build_model(self, sizes: tuple, dropout: float) -> nn.Sequential:
         # create model by nn.Sequential
@@ -69,17 +76,63 @@ class TarNetBase(nn.Module):
             layers = layers[:-2] # remove the last ReLU and Dropout
         return nn.Sequential(*layers)
 
+    def _build_conv(self, specs, activation):
+        if not specs:
+            return None
+        layers = []
+        in_channels = specs[0].get("in_channels")
+        if in_channels is None:
+            raise ValueError("The first convolution spec must include 'in_channels'.")
+
+        for cfg in specs:
+            out_channels = cfg["out_channels"]
+            conv_kwargs = {
+                "kernel_size": cfg.get("kernel_size", 3),
+                "stride": cfg.get("stride", 1),
+                "padding": cfg.get("padding", 0),
+                "dilation": cfg.get("dilation", 1),
+                "groups": cfg.get("groups", 1),
+                "bias": cfg.get("bias", True),
+            }
+            conv_layer = nn.Conv2d(
+                cfg.get("in_channels", in_channels),
+                out_channels,
+                **conv_kwargs,
+            )
+            if cfg.get("spectral_norm"):
+                conv_layer = spectral_norm(conv_layer)
+            layers.append(conv_layer)
+            if self.bn:
+                layers.append(nn.BatchNorm2d(out_channels))
+            if activation is not None:
+                act_module = activation() if callable(activation) else activation
+                layers.append(act_module)
+            pool_cfg = cfg.get("pool")
+            if pool_cfg:
+                pool_cfg = dict(pool_cfg)
+                pool_cls = pool_cfg.pop("type", "max").lower()
+                if pool_cls == "avg":
+                    layers.append(nn.AvgPool2d(**pool_cfg))
+                else:
+                    layers.append(nn.MaxPool2d(**pool_cfg))
+            in_channels = out_channels
+        return nn.Sequential(*layers)
+
     def forward(
             self,
             inputs: torch.Tensor
         ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if self.conv_layers is not None:
+            inputs = self.conv_layers(inputs)
+            inputs = self.flatten(inputs)
         fr = nn.functional.relu(self.model_z(inputs))
         y0 = self.model_y0(fr)
         y1 = self.model_y1(fr)
         if self.return_prob:
-            y0 = torch.softmax(y0, dim = 1)
-            y1 = torch.softmax(y1, dim = 1)
+            y0 = nn.functional.softmax(y0, dim=-1)
+            y1 = nn.functional.softmax(y1, dim=-1)
         return y0, y1, fr
+
 
 class SpectralNormClassifier(nn.Module):
     """
