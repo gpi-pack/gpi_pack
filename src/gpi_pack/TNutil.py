@@ -18,6 +18,7 @@ from sklearn.metrics import accuracy_score
 import matplotlib.pyplot as plt
 from typing import Union, Callable
 
+
 class TarNetBase(nn.Module):
     def __init__(self,
             sizes_z: tuple = [2048],
@@ -120,18 +121,20 @@ class TarNetBase(nn.Module):
 
     def forward(
             self,
-            inputs: torch.Tensor
+            inputs: torch.Tensor,
+            treatments: torch.Tensor,
+            confounders: torch.Tensor | None = None
         ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if self.conv_layers is not None:
             inputs = self.conv_layers(inputs)
             inputs = self.flatten(inputs)
         fr = nn.functional.relu(self.model_z(inputs))
-        y0 = self.model_y0(fr)
-        y1 = self.model_y1(fr)
-        if self.return_prob:
-            y0 = nn.functional.softmax(y0, dim=-1)
-            y1 = nn.functional.softmax(y1, dim=-1)
-        return y0, y1, fr
+        if confounders is not None:
+            fr = torch.cat((fr, confounders), dim=1)
+
+        fr_new = torch.cat((fr, treatments), dim=1)  # concatenate treatment info
+        y = self.model_y(fr_new)
+        return y, fr
 
 
 class SpectralNormClassifier(nn.Module):
@@ -206,7 +209,7 @@ class SpectralNormClassifier(nn.Module):
         dropout: float = 0.0,
         batch_norm: bool = False,
         lr: float = 2e-6,
-        nepoch: int = 20,
+        nepoch: int = 200,
         batch_size: int = 32,
         patience: int = 5,
         min_delta: float = 1e-4,
