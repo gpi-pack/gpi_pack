@@ -49,8 +49,7 @@ class TarNetBase(nn.Module):
         self.conv_layers = self._build_conv(conv_layers or [], conv_activation)
         self.flatten = nn.Flatten(start_dim=1)
         self.model_z = self._build_model(sizes_z, dropout)
-        self.model_y1 = self._build_model([sizes_z[-1]] + sizes_y, dropout)
-        self.model_y0 = self._build_model([sizes_z[-1]] + sizes_y, dropout)
+        self.model_y = self._build_model([sizes_z[-1]] + sizes_y, dropout)
 
     def _build_model(self, sizes: tuple, dropout: float) -> nn.Sequential:
         # create model by nn.Sequential

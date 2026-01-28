@@ -683,6 +683,10 @@ class TarNetHyperparameterTuner:
     bn: list[bool], list of batch normalization options (e.g., [True, False])
     patience_min: int, minimum value of uniform distribution for the patience for early stopping (default: 5)
     patience_max: int, maximum value of uniform distribution for the patience for early stopping (default: 20)
+    conv_layers: list of dict, specification for convolutional layers applied before the shared representation.
+                    Example: [{"in_channels":3, "out_channels":32, "kernel_size":3, "padding":1, "pool":{"kernel_size":2}}].
+                    Leave as None when inputs are already flattened.
+    conv_activation: callable returning an nn.Module activation for conv blocks (default: nn.ReLU
 
     Example:
     # Load optuna
@@ -710,6 +714,8 @@ class TarNetHyperparameterTuner:
         step_size: list[int] = [5, 10],
         architecture_y: list[list[str]] = ["[1]"],
         architecture_z: list[list[str]] = ["[1024]", "[2048]", "[4096]"],
+        conv_layers: list[dict] | None = None,
+        conv_activation: Callable[[], nn.Module] = nn.ReLU,
         bn: list[bool] = [True, False],
         patience_min: int = 5,
         patience_max: int = 20,
@@ -737,6 +743,8 @@ class TarNetHyperparameterTuner:
         self.architecture_y = architecture_y; self.architecture_z = architecture_z
         self.bn = bn; self.patience_min = patience_min; self.patience_max = patience_max
         self.model_dir = model_dir
+        self.conv_layers = conv_layers
+        self.conv_activation = conv_activation
 
     def get_value_or_suggestion(self, name, values, suggest_method):
         if len(values) == 1:
@@ -753,6 +761,10 @@ class TarNetHyperparameterTuner:
         architecture_z = trial.suggest_categorical('architecture_z', self.architecture_z)
         bn = trial.suggest_categorical('bn', self.bn)
         patience = trial.suggest_int('patience', self.patience_min, self.patience_max)
+        conv_layers = trial.suggest_categorical('conv_layers', self.conv_layers)
+        conv_activation = trial.suggest_categorical('conv_activation', self.conv_activation)
+        if isinstance(conv_layers, str):
+            conv_layers = ast.literal_eval(conv_layers)
 
         model = TarNet(
             epochs= ast.literal_eval(epoch), #convert string to integer
@@ -760,6 +772,8 @@ class TarNetHyperparameterTuner:
             learning_rate=learning_rate,
             architecture_y=ast.literal_eval(architecture_y), #convert string to list of integers
             architecture_z=ast.literal_eval(architecture_z), #convert string to list of integers
+            conv_layers=conv_layers,
+            conv_activation=conv_activation,
             dropout=dropout,
             step_size=step_size,
             bn=bn,
