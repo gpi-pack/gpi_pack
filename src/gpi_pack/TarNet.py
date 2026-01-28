@@ -634,7 +634,7 @@ def estimate_k_ate(
         if ps_model == SpectralNormClassifier:
             # Make sure to set the input_dim to the last layer of the shared representation
             # when using the default ps_model (SpectralNormClassifier)
-            ps_params.setdefault("input_dim", architecture_z[-1])
+            ps_params.setdefault("input_dim", fr.shape[1])
 
         #train propensity score purely on test data (use two-fold cross fitting)
         psi, _ = estimate_psi_split(
