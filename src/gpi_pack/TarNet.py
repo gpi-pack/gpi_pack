@@ -51,6 +51,8 @@ class TarNet:
         learning_rate: float = 2e-5,
         architecture_y: list = [1],
         architecture_z: list = [1024],
+        conv_layers: list[dict] | None = None,
+        conv_activation: Callable[[], nn.Module] = nn.ReLU,
         dropout: float = 0.3,
         step_size: int = None,
         bn: bool = False,
@@ -69,6 +71,10 @@ class TarNet:
         - learning_rate: float, learning rate
         - architecture_y: list, architecture of the outcome model
         - architecture_z: list, architecture of the shared representation model
+        - conv_layers: list of convolutional layer specs applied before the shared representation.
+                   Example: [{"in_channels":3, "out_channels":32, "kernel_size":3, "padding":1, "pool":{"kernel_size":2}}].
+                   Leave as None when inputs are already flattened.
+        - conv_activation: callable returning an nn.Module activation for conv blocks (default: nn.ReLU)
         - dropout: float, dropout rate
         - step_size: int, step size for the learning rate scheduler (if None, no scheduler)
         - bn: bool, whether to use batch normalization
@@ -88,6 +94,8 @@ class TarNet:
             sizes_y = architecture_y,
             dropout=dropout,
             bn=bn,
+            conv_layers=conv_layers,
+            conv_activation=conv_activation,
         ).to(self.device)
         self.optim = torch.optim.AdamW(self.model.parameters(), lr=learning_rate, eps=1e-8)
         self.step_size = step_size

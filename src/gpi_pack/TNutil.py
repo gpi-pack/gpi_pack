@@ -25,7 +25,6 @@ class TarNetBase(nn.Module):
             sizes_y: tuple = [200, 1],
             dropout: float=None,
             bn: bool = False,
-            return_prob: bool = False,
             conv_layers: list[dict] | None = None,
             conv_activation: Callable[[], nn.Module] = nn.ReLU,
         ):
@@ -43,16 +42,10 @@ class TarNetBase(nn.Module):
             dropout: float, dropout rate (default: 0.3)
             bn: bool, whether to use batch normalization (default: False)
                 Note that after the first layer everything is the feedforward network.
-            return_prob: bool, whether to return the predicted probabilities (default: False)
-                If return_prob is True, the model will return the predicted probabilities
-                for the outcome prediction. Otherwise, it will return the predicted values.
-                When it is true, make sure that the size of the last layer of sizes_y matches 
-                the number of classes for classification tasks (e.g., 2 for binary classification).
         '''
 
         super(TarNetBase, self).__init__()
         self.bn = bn
-        self.return_prob = return_prob
         self.conv_layers = self._build_conv(conv_layers or [], conv_activation)
         self.flatten = nn.Flatten(start_dim=1)
         self.model_z = self._build_model(sizes_z, dropout)
@@ -539,64 +532,3 @@ def estimate_psi_split(
     psi2 = dml_score(t[ind2], y[ind2], tpreds[ind2], y1[ind2], y0[ind2])
     psi = np.append(psi1, psi2)
     return psi, tpreds
-
-def TarNet_loss(
-        y_true: torch.Tensor,
-        t_true: torch.Tensor,
-        y0_pred: torch.Tensor,
-        y1_pred: torch.Tensor,
-        return_probability: bool = False,
-    ) -> torch.Tensor:
-    """
-    Calculate loss function for TarNet.
-
-    Args:
-        y_true: torch.Tensor of shape (N,), containing the true outcome.
-                When return_probability=True, y_true should contain class indices.
-        t_true: torch.Tensor of shape (N,) or (N, 1) with the treatment indicator (0 or 1).
-        y0_pred: torch.Tensor, predicted outcome when untreated.
-                 For categorical outcomes, shape (N, num_classes) with probabilities.
-        y1_pred: torch.Tensor, predicted outcome when treated.
-                 For categorical outcomes, shape (N, num_classes) with probabilities.
-        return_probability: bool, if True the predictions are assumed to be probability distributions
-                            (from softmax) and a categorical loss is applied;
-                            otherwise an MSE loss is used.
-    Returns:
-        A scalar torch.Tensor representing the loss.
-    """
-    # Get indices for control (t==0) and treated (t==1) groups.
-    T0_indices = (t_true.view(-1) == 0).nonzero(as_tuple=True)[0]
-    T1_indices = (t_true.view(-1) == 1).nonzero(as_tuple=True)[0]
-
-    if return_probability:
-        # For categorical outcomes, assume y_true contains class indices.
-        # Compute the negative log likelihood loss per group.
-        if T0_indices.numel() > 0:
-            y0_selected = y0_pred[T0_indices]           # (n_control, num_classes)
-            y_true_control = y_true[T0_indices].long()    # true class labels for control group
-            # Get the probability of the true class for each sample.
-            prob_control = y0_selected[torch.arange(y0_selected.size(0)), y_true_control]
-            loss0 = -torch.log(prob_control + 1e-8).mean()
-        else:
-            loss0 = 0.0  # No control group observations; set loss0 to 0.
-
-        if T1_indices.numel() > 0:
-            y1_selected = y1_pred[T1_indices]           # (n_treated, num_classes)
-            y_true_treated = y_true[T1_indices].long()    # true class labels for treated group
-            prob_treated = y1_selected[torch.arange(y1_selected.size(0)), y_true_treated]
-            loss1 = -torch.log(prob_treated + 1e-8).mean()
-        else:
-            loss1 = 0.0  # No treatment group observations; set loss1 to 0.
-    else:
-        # Use Mean Squared Error loss.
-        if T0_indices.numel() > 0:
-            loss0 = ((y0_pred.view(-1) - y_true.view(-1))[T0_indices] ** 2).mean()
-        else:
-            loss0 = 0.0  # No control group observations; set loss0 to 0.
-            
-        if T1_indices.numel() > 0:
-            loss1 = ((y1_pred.view(-1) - y_true.view(-1))[T1_indices] ** 2).mean()
-        else:
-            loss1 = 0.0  # No treatment group observations; set loss1 to 0.
-
-    return loss0 + loss1
