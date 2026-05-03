@@ -349,6 +349,7 @@ class TarNet:
             dataset = TensorDataset(r, t)
         dataloader  = DataLoader(dataset, batch_size= self.batch_size)
 
+        self.model.eval()
         y_preds = []; frs = []
         if grad_required:
             if c is not None:
