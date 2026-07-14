@@ -4,6 +4,9 @@ Implementation of Generating Images with Stable Diffusion.
 Currently, the implementation supports the Stable Diffusion 1.5 and 2.1 architectures,
 and it does not suppoert the Stable Diffusion 3 and 3.5 architectures.
 We will update the implementation to support the latest architectures in the future.
+
+Package update on 2025-10-15:
+- Update support for new checkpoint https://huggingface.co/stabilityai/stable-diffusion-xl-base-1.0
 '''
 
 from __future__ import annotations

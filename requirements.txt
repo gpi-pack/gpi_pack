@@ -11,3 +11,5 @@ patsy>=0.5.2
 diffusers >= 0.34.0
 pillow >= 11.2.0
 torchvision >= 0.20.0
+av >= 10.0.0
+imageio[ffmpeg] >= 2.31.0

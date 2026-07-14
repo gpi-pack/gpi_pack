@@ -3,19 +3,22 @@
 [![Python Versions](https://img.shields.io/pypi/pyversions/gpi_pack.svg)](https://pypi.org/project/gpi_pack/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-[gpi_pack](https://gpi-pack.github.io/) is a Python package for statistical inference with text and image data powered by Large Language Models.
+[gpi_pack](https://gpi-pack.github.io/) is a Python package for statistical
+inference with text, image, and video data powered by generative AI models.
 
 ## Table of Contents
 - [Installation](#installation)
 - [Quick Guide](#quick-guide)
   - [Extracting Hidden States from an LLM](#extracting-hidden-states-from-an-llm)
+  - [Regenerating Videos and Extracting Representations](#regenerating-videos-and-extracting-representations)
   - [Estimating Causal Effect](#estimating-causal-effect)
   - [Hyperparameter Tuning (Optinoal)](#hyperparameter-tuning)
 - [License](#license)
 - [Contact](#contact)
 
 ## Installation
-The package requires Python 3.7 or higher. The main dependencies are listed in the [requirements.txt file](requirements.txt).
+The package requires Python 3.9 or higher. The main dependencies are listed in
+the [requirements.txt file](requirements.txt).
 
 ### Installing via PyPI
 You can install gpi_pack directly using pip:
@@ -83,7 +86,53 @@ extract_and_save_hidden_states(
 )
 ```
 
-### Estimating Causal Effect
+### Regenerating Videos and Extracting Representations
+
+Install the optional video codecs and use `extract_videos` to split each input
+video, reconstruct each segment with the NVIDIA Cosmos tokenizer, and save the
+model representation used by the video paper:
+
+```bash
+pip install "gpi_pack[video]"
+```
+
+```python
+import torch
+from gpi_pack.video import extract_videos
+
+outputs = extract_videos(
+    videos="path/to/videos",          # one file, one directory, or a list
+    output_hidden_dir="outputs/hidden",
+    output_video_dir="outputs/reconstructed",  # omit to skip decoding
+    segment_seconds=5,
+    frame_size=(320, 480),            # optional; preprocessing is recorded
+)
+
+payload = torch.load(outputs[0].representation_path, weights_only=True)
+representation = payload["representation"]  # unbatched [C, H, W]
+```
+
+The saved representation is the final Cosmos tensor immediately before the
+decoder, mean-pooled over latent time. The paper reports a `(16, 40, 60)`
+representation, but does not specify its resize or frame-sampling policy, so
+the package exposes these choices as `frame_size` and `max_frames` and records
+them in every payload. The default `max_frames=121` follows the supported
+context listed for the default Cosmos checkpoint. Set `save_decoder_input=True`
+or `save_latent=True` to retain the unpooled state or encoder latent. Audio is
+not reconstructed.
+
+For an in-memory RGB array, reuse one loaded model:
+
+```python
+from gpi_pack.video import CosmosVideoExtractor
+
+extractor = CosmosVideoExtractor(frame_size=(320, 480))
+result = extractor.reconstruct_video(frames)  # frames: [T, H, W, 3]
+reconstructed = result.reconstruction         # [1, 3, T, H, W]
+representation = result.representation        # [1, C, H_latent, W_latent]
+```
+
+### Estimating Causal Effect (Static Setup)
 
 Once you extract the hidden states, then you are ready to estimate the treatment effect!
 
@@ -134,6 +183,42 @@ ate, se = estimate_k_ate(
 )
 print("ATE:", ate, "SE:", se)
 ```
+
+### Estimating Causal Effect (Dynamic Setup)
+
+`estimate_k_ipsi` handles both vector-only and aligned text/video representations.
+Its sequence mask is inferred from `W`: observed treatments are finite binary
+values, and any unused trailing positions must be `NaN`. Supplying `R_video`
+automatically enables multimodal estimation:
+
+For existing data, convert with `W = np.where(mask.astype(bool), W, np.nan)`.
+A finite `0` is always treated as an observed control value, never as padding.
+
+```python
+from gpi_pack.dyn_gpi import estimate_k_ipsi
+
+result = estimate_k_ipsi(
+    R=R_text,                 # [N, T, F_text]
+    R_video=R_video,          # [N, T, C, D, H, W] or [N, T, D, H, W]
+    W=W,                      # Treatment, expected [N, T], with trailing padding set to NaN
+    Y=Y,                      # Outcome, expected [N]
+    delta_seq=delta_seq,
+    text_input_dim=R_text.shape[-1],
+)
+```
+
+The text and video encoders are configurable through `text_hidden_dims`,
+`text_out_dim`, `video_channels`, and `video_out_dim`. Both modes use the same
+cross-fitting, nuisance-estimation, and influence-function implementation. This
+API estimates the scalar-outcome estimand (`Y` is `[N]`); it does not by itself
+implement a repeated outcome trajectory with `Y` shaped `[N, T]`.
+
+Set `n_boot` to a positive integer to return 95% Rademacher
+multiplier-bootstrap bands as `ll2` and `ul2`, simultaneous over the supplied
+intervention grid. With the default `n_boot=0`, both values are `None`.
+Trajectory-wide inference for repeated outcomes is distinct and should be
+implemented against the repeated-outcome estimand directly.
+
 
 ### Hyperparameter Tuning
 You can easily fine-tune the parameter of the outcome model as follows.
