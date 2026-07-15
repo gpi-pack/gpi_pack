@@ -16,4 +16,4 @@ from .video import (
     extract_videos,
 )
 
-__version__ = "0.2.0"
+__version__ = "0.2.1"
