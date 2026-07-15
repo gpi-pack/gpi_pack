@@ -478,14 +478,38 @@ best run with process-isolated Optuna workers.
 This project is licensed under the MIT License. See the LICENSE file for details.
 
 ## References
-Please refer to [the original paper](https://arxiv.org/abs/2410.00903) for detailed information on the methodology and findings.
+Please refer to the following papers for detailed information on the methodology and findings.
 
 ```bibtex
-@article{imai2024causal,
-  title={Causal Representation Learning with Generative Artificial Intelligence: Application to Texts as Treatments},
+@article{imai2026causal,
+  title={Causal Inference with Generative Artificial Intelligence: Application to Texts as Treatments},
   author={Imai, Kosuke and Nakamura, Kentaro},
-  journal={arXiv preprint arXiv:2410.00903},
-  year={2024}
+  journal={Journal of the American Statistical Association},
+  number={just-accepted},
+  pages={1--27},
+  year={2026},
+  publisher={Taylor \& Francis}
+}
+
+@article{imai2025genai,
+  title={Genai-powered inference},
+  author={Imai, Kosuke and Nakamura, Kentaro},
+  journal={arXiv preprint arXiv:2507.03897},
+  year={2025}
+}
+
+@article{nakamura2026genai,
+  title={GenAI Powered Dynamic Causal Inference with Unstructured Data},
+  author={Nakamura, Kentaro and Imai, Kosuke},
+  journal={arXiv preprint arXiv:2605.07834},
+  year={2026}
+}
+
+@article{nakamura2026causal,
+  title={Causal Inference with Video Features as Treatments},
+  author={Nakamura, Kentaro and Breuer, Adam and Crespin, Michael H and Dietrich, Bryce J and Imai, Kosuke},
+  journal={arXiv preprint arXiv:2607.06126},
+  year={2026}
 }
 ```
 
