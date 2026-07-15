@@ -8,6 +8,7 @@ transformers>=4.20.0
 tqdm>=4.60.0
 accelerate>=0.15.0
 patsy>=0.5.2
+optuna>=3.0.0
 diffusers >= 0.34.0
 pillow >= 11.2.0
 torchvision >= 0.20.0

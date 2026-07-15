@@ -38,6 +38,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+tune = [
+    "optuna>=3.0.0",
+]
 video = [
     "av>=10.0.0",
     "imageio[ffmpeg]>=2.31.0",

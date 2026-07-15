@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import torch
 import torch.nn as nn
 from torch.utils.data import TensorDataset, DataLoader, RandomSampler, SequentialSampler
@@ -7,7 +8,6 @@ import numpy as np
 from sklearn.model_selection import KFold, train_test_split
 import matplotlib.pyplot as plt
 from tqdm import tqdm
-import ast
 import os
 from patsy import dmatrix
 import pandas as pd
@@ -18,8 +18,20 @@ from .TNutil import (
     estimate_psi_split,
     SpectralNormClassifier,
 )
+from ._tuning import (
+    normalize_architectures,
+    normalize_options,
+    record_resolved_params,
+    report_and_prune,
+    require_optuna,
+    suggest_architecture,
+    suggest_categorical,
+    suggest_float,
+    validate_minimize_study,
+    validate_n_jobs,
+)
 
-from typing import Union, Callable
+from typing import Any, Callable, Union
 
 
 class TarNet:
@@ -86,7 +98,11 @@ class TarNet:
         '''
 
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        print(f"Device: Using {self.device}")
+        if verbose:
+            print(f"Device: Using {self.device}")
+        torch.manual_seed(int(random_state))
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(int(random_state))
         self.epochs = epochs; self.batch_size = batch_size
         self.train_dataloader = None; self.valid_dataloader = None
         self.model = TarNetBase(
@@ -99,15 +115,22 @@ class TarNet:
         ).to(self.device)
         self.optim = torch.optim.AdamW(self.model.parameters(), lr=learning_rate, eps=1e-8)
         self.step_size = step_size
+        self.scheduler = None
         if self.step_size is not None:
-            self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(self.optim, mode='min', factor=0.5, patience=5)
+            self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                self.optim,
+                mode="min",
+                factor=0.5,
+                patience=int(self.step_size),
+            )
         self.loss_f = torch.nn.MSELoss()
-        self.valid_loss = 0
+        self.valid_loss = None
+        self.best_valid_loss = None
         self.patience = patience
         self.min_delta = min_delta
         self.model_dir = model_dir
-        if self.model_dir is not None and not os.path.exists(self.model_dir):
-            print(f"The directory {self.model_dir} does not exist.")
+        if self.model_dir is not None:
+            os.makedirs(self.model_dir, exist_ok=True)
         self.verbose = verbose
         self.random_state = random_state
 
@@ -158,7 +181,26 @@ class TarNet:
             train_dataset = TensorDataset(r_train, c_train, t_train, y_train)
             valid_dataset = TensorDataset(r_test, c_test, t_test, y_test)
         
-        self.train_dataloader = DataLoader(train_dataset, batch_size=self.batch_size, sampler = RandomSampler(train_dataset))
+        train_batch_size = min(int(self.batch_size), len(train_dataset))
+        drop_last = False
+        if self.model.bn:
+            if train_batch_size < 2:
+                raise ValueError(
+                    "bn=True requires at least two training observations and "
+                    "batch_size >= 2."
+                )
+            # BatchNorm cannot estimate variance from a singleton training
+            # batch. RandomSampler changes which observation is omitted across
+            # epochs when this final incomplete batch is dropped.
+            drop_last = len(train_dataset) % train_batch_size == 1
+
+        generator = torch.Generator().manual_seed(int(self.random_state))
+        self.train_dataloader = DataLoader(
+            train_dataset,
+            batch_size=train_batch_size,
+            sampler=RandomSampler(train_dataset, generator=generator),
+            drop_last=drop_last,
+        )
         self.valid_dataloader = DataLoader(valid_dataset, batch_size=self.batch_size, sampler = SequentialSampler(valid_dataset))
 
     def fit(self,
@@ -168,6 +210,8 @@ class TarNet:
             C: Union[np.ndarray, torch.Tensor] = None,
             valid_perc: float = 0.2,
             plot_loss: bool = True,
+            *,
+            epoch_callback: Callable[[int, float], None] | None = None,
         ):
         '''
         Fit the TarNet model
@@ -193,78 +237,91 @@ class TarNet:
             )
             use_confounder = False
             self.create_dataloaders(R_train, R_test, Y_train, Y_test, T_train, T_test) #r, y, t
-        all_training_loss = []; all_valid_loss = []; best_loss = 1e10; epochs_no_improve = 0
+        all_training_loss = []
+        all_valid_loss = []
+        best_loss = float("inf")
+        best_state = None
+        epochs_no_improve = 0
 
         #training loop
-        self.model.train()
         for epoch in range(self.epochs):
-            loss_list = []
-            if self.verbose:
-                pbar = tqdm(total=len(self.train_dataloader), desc=f'Training (Epoch {epoch})')
-
-            #Need to double check if the following is correct
-            if C is not None:
-                for _, (r, c, t, y) in enumerate(self.train_dataloader): #r, c, t, y
-                    if self.verbose:
-                        pbar.update()
-                    self.optim.zero_grad()
-                    y_pred, _ = self.model(
-                        inputs = r.to(self.device), 
-                        treatments = t.to(self.device),
-                        confounders = c.to(self.device),
-                    ) #y_pred, fr
-                    loss = self.loss_f(
-                        y_pred,
-                        y.to(self.device),
-                    )
-                    loss.backward()
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0) #gradient clipping
-                    self.optim.step()
-                    loss_list.append(loss.item() / len(y))
-            else:
-                for _, (r, t, y) in enumerate(self.train_dataloader):
-                    if self.verbose:
-                        pbar.update()
-                    self.optim.zero_grad()
-                    y_pred, _ = self.model(
-                        inputs = r.to(self.device), 
-                        treatments = t.to(self.device),
-                    )
-                    loss = self.loss_f(
-                        y_pred,
-                        y.to(self.device),
-                    )
-                    loss.backward()
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0) #gradient clipping
-                    self.optim.step()
-                    loss_list.append(loss.item() / len(y))
-            self.model.eval()
-            valid_loss = self.validate_step(use_confounder=use_confounder)
-            all_training_loss.append(np.mean(loss_list)); all_valid_loss.append(valid_loss)
-            if self.verbose:
-                print(f"epoch: {epoch}--------- train_loss: {np.mean(loss_list)} ----- valid_loss: {valid_loss}")
             self.model.train()
-            if self.step_size is not None:
-                self.scheduler.step(valid_loss) #when using ReduceLROnPlateau
+            training_loss_sum = 0.0
+            training_count = 0
+            pbar = (
+                tqdm(total=len(self.train_dataloader), desc=f"Training (Epoch {epoch})")
+                if self.verbose
+                else None
+            )
 
-            #save the best model
+            if C is not None:
+                for r, c, t, y in self.train_dataloader:
+                    if pbar is not None:
+                        pbar.update()
+                    self.optim.zero_grad()
+                    y_pred, _ = self.model(
+                        inputs=r.to(self.device),
+                        treatments=t.to(self.device),
+                        confounders=c.to(self.device),
+                    )
+                    loss = self.loss_f(y_pred, y.to(self.device))
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+                    self.optim.step()
+                    training_loss_sum += loss.item() * len(y)
+                    training_count += len(y)
+            else:
+                for r, t, y in self.train_dataloader:
+                    if pbar is not None:
+                        pbar.update()
+                    self.optim.zero_grad()
+                    y_pred, _ = self.model(
+                        inputs=r.to(self.device),
+                        treatments=t.to(self.device),
+                    )
+                    loss = self.loss_f(y_pred, y.to(self.device))
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+                    self.optim.step()
+                    training_loss_sum += loss.item() * len(y)
+                    training_count += len(y)
+
+            if pbar is not None:
+                pbar.close()
+
+            train_loss = training_loss_sum / max(training_count, 1)
+            valid_loss = float(self.validate_step(use_confounder=use_confounder))
+            all_training_loss.append(train_loss)
+            all_valid_loss.append(valid_loss)
+            if self.verbose:
+                print(
+                    f"epoch: {epoch} --- train_loss: {train_loss:.6f} "
+                    f"--- valid_loss: {valid_loss:.6f}"
+                )
+            if self.step_size is not None:
+                self.scheduler.step(valid_loss)
+
             if valid_loss + self.min_delta < best_loss:
+                best_loss = valid_loss
+                best_state = copy.deepcopy(self.model.state_dict())
                 if self.model_dir != "" and self.model_dir is not None:
                     torch.save(self.model.state_dict(), f"{self.model_dir}/best_TarNet.pth")
-                best_loss = valid_loss
                 epochs_no_improve = 0
             else:
                 epochs_no_improve += 1
 
-            #early stopping options
+            if epoch_callback is not None:
+                epoch_callback(epoch, valid_loss)
+
             if epoch >= 5 and epochs_no_improve >= self.patience:
-                print(f"Early stopping! The number of epoch is {epoch}.")
+                if self.verbose:
+                    print(f"Early stopping at epoch {epoch}.")
                 break
 
-        if self.model_dir != "" and self.model_dir is not None:
-            if self.verbose:
-                print(f"Loading the model saved at {self.model_dir}...")
-            self.model.load_state_dict(torch.load(f"{self.model_dir}/best_TarNet.pth"))
+        if best_state is not None:
+            self.model.load_state_dict(best_state)
+        self.best_valid_loss = best_loss
+        self.valid_loss = torch.tensor(best_loss, dtype=torch.float32)
 
         if plot_loss:
             _ = plt.plot(all_training_loss, label = "Training Loss")
@@ -273,40 +330,50 @@ class TarNet:
             plt.legend()
             plt.show()
 
+        return float(best_loss)
+
     def validate_step(self, use_confounder: bool = False) -> torch.Tensor:
         '''
         Method to Validate the model
         '''
 
-        valid_loss = []
+        was_training = self.model.training
+        self.model.eval()
+        loss_sum = 0.0
+        count = 0
         with torch.no_grad():
-            if self.verbose:
-                pbar = tqdm(total=len(self.valid_dataloader), desc= f'Validating')
+            pbar = (
+                tqdm(total=len(self.valid_dataloader), desc="Validating")
+                if self.verbose
+                else None
+            )
             if use_confounder:
-                for _, (r, c, t, y) in enumerate(self.valid_dataloader):
-                    if self.verbose:
+                for r, c, t, y in self.valid_dataloader:
+                    if pbar is not None:
                         pbar.update()
                     y_pred, _ = self.model(
-                        inputs = r.to(self.device), 
-                        treatments = t.to(self.device),
-                        confounders = c.to(self.device),
+                        inputs=r.to(self.device),
+                        treatments=t.to(self.device),
+                        confounders=c.to(self.device),
                     )
-                    loss = self.loss_f(
-                        y_pred,
-                        y.to(self.device),
-                    )
-                    valid_loss.append(loss / len(y))
+                    loss = self.loss_f(y_pred, y.to(self.device))
+                    loss_sum += loss.item() * len(y)
+                    count += len(y)
             else:
-                for _, (r, t, y) in enumerate(self.valid_dataloader): #r t y
-                    if self.verbose:
+                for r, t, y in self.valid_dataloader:
+                    if pbar is not None:
                         pbar.update()
                     y_pred, _ = self.model(inputs = r.to(self.device), treatments = t.to(self.device))
-                    loss = self.loss_f(
-                        y_pred,
-                        y.to(self.device),
-                    )
-                    valid_loss.append(loss / len(y))
-        self.valid_loss = torch.Tensor(valid_loss).mean()
+                    loss = self.loss_f(y_pred, y.to(self.device))
+                    loss_sum += loss.item() * len(y)
+                    count += len(y)
+
+            if pbar is not None:
+                pbar.close()
+
+        if was_training:
+            self.model.train()
+        self.valid_loss = torch.tensor(loss_sum / max(count, 1), dtype=torch.float32)
         return self.valid_loss
 
     def predict(
@@ -353,7 +420,12 @@ class TarNet:
         y_preds = []; frs = []
         if grad_required:
             if c is not None:
-                for r, c, t in tqdm(dataloader, total=len(dataloader), desc = 'Predicting'):
+                for r, c, t in tqdm(
+                    dataloader,
+                    total=len(dataloader),
+                    desc="Predicting",
+                    disable=not self.verbose,
+                ):
                     y_pred, fr = self.model(
                         inputs = r.to(self.device), 
                         treatments = t.to(self.device),
@@ -362,7 +434,12 @@ class TarNet:
                     y_preds.append(y_pred)
                     frs.append(fr)
             else:
-                for r, t in tqdm(dataloader, total=len(dataloader), desc = 'Predicting'): #r
+                for r, t in tqdm(
+                    dataloader,
+                    total=len(dataloader),
+                    desc="Predicting",
+                    disable=not self.verbose,
+                ):
                     y_pred, fr = self.model(
                         inputs = r.to(self.device),
                         treatments = t.to(self.device),
@@ -372,7 +449,12 @@ class TarNet:
         else:
             with torch.no_grad():
                 if c is not None:
-                    for r, c, t in tqdm(dataloader, total=len(dataloader), desc = 'Predicting'):
+                    for r, c, t in tqdm(
+                        dataloader,
+                        total=len(dataloader),
+                        desc="Predicting",
+                        disable=not self.verbose,
+                    ):
                         y_pred, fr = self.model(
                             inputs = r.to(self.device), 
                             treatments = t.to(self.device),
@@ -381,7 +463,12 @@ class TarNet:
                         y_preds.append(y_pred)
                         frs.append(fr)
                 else:
-                    for r, t in tqdm(dataloader, total=len(dataloader), desc = 'Predicting'): #r
+                    for r, t in tqdm(
+                        dataloader,
+                        total=len(dataloader),
+                        desc="Predicting",
+                        disable=not self.verbose,
+                    ):
                         y_pred, fr = self.model(
                             inputs = r.to(self.device),
                             treatments = t.to(self.device),
@@ -666,126 +753,252 @@ def estimate_k_ate(
 
 
 class TarNetHyperparameterTuner:
-    '''
-    Class for Hyperparameter tuning for TarNet
+    """Efficient, reproducible Optuna tuning for :class:`TarNet`.
 
-    Parameters:
-    T: torch.Tensor, treatment variables
-    Y: torch.Tensor, outcome variables
-    R: torch.Tensor, internal representations
-    epoch: int, number of epochs
-    batch_size: int, batch size
-    valid_perc: float, validation percentage
-    learning_rate: list[float, float], range of learning rate
-    dropout: list[float, float], range of dropout
-    step_size: list[int], list of step sizes
-    architecture_y: list[list[str]], list of architectures for Y (e.g., ["[256, 128, 1]", "[256, 128, 64, 1]"])
-    architecture_z: list[list[str]], list of architectures for Z (e.g., ["[2048]", "[4096, 2048]"])
-    bn: list[bool], list of batch normalization options (e.g., [True, False])
-    patience_min: int, minimum value of uniform distribution for the patience for early stopping (default: 5)
-    patience_max: int, maximum value of uniform distribution for the patience for early stopping (default: 20)
-    conv_layers: list of dict, specification for convolutional layers applied before the shared representation.
-                    Example: [{"in_channels":3, "out_channels":32, "kernel_size":3, "padding":1, "pool":{"kernel_size":2}}].
-                    Leave as None when inputs are already flattened.
-    conv_activation: callable returning an nn.Module activation for conv blocks (default: nn.ReLU
+    Native Python values are preferred, but the legacy string forms such as
+    ``"[256, 128, 1]"`` and ``"100"`` remain accepted. Convolution settings
+    are fixed model configuration rather than invalid Optuna categories.
+    """
 
-    Example:
-    # Load optuna
-    import optuna
-    # Load data and set hyperparameters
-    obj = TarNetHyperparameterTuner(T, Y, R, epoch = 100)
-    # Hyperparameter tuning with Optuna
-    study = optuna.create_study(direction='minimize')
-    study.optimize(obj.objective, n_trials=100)
-    #Print the best hyperparameters
-    print("Best hyperparameters: ", study.best_params)
-
-    '''
     def __init__(
         self,
-        T, Y, R,
+        T,
+        Y,
+        R,
         C: Union[list, np.ndarray] = None,
         formula_C: str = None,
         data: pd.DataFrame = None,
-        epoch: list[str] = ["100", "200"],
-        batch_size: int = 64,
+        epoch: Any = (100, 200),
+        batch_size: Any = 64,
         valid_perc: float = 0.2,
-        learning_rate: list[float, float] = [1e-4, 1e-5],
-        dropout: list[float, float] = [0.1, 0.2],
-        step_size: list[int] = [5, 10],
-        architecture_y: list[list[str]] = ["[1]"],
-        architecture_z: list[list[str]] = ["[1024]", "[2048]", "[4096]"],
+        learning_rate: Any = (1e-5, 1e-4),
+        dropout: Any = (0.1, 0.2),
+        step_size: Any = (None,),
+        architecture_y: Any = ((1,),),
+        architecture_z: Any = ((1024,), (2048,), (4096,)),
         conv_layers: list[dict] | None = None,
         conv_activation: Callable[[], nn.Module] = nn.ReLU,
-        bn: list[bool] = [True, False],
+        bn: Any = (False,),
         patience_min: int = 5,
         patience_max: int = 20,
         model_dir: str = None,
+        random_state: int = 42,
+        verbose: bool = False,
     ):
-        #loading data
-        self.T = T; self.Y = Y
+        if formula_C is not None and C is not None:
+            raise ValueError("Provide either C or formula_C, not both.")
         if formula_C is not None:
             if data is None:
                 raise ValueError("If formula_C is provided, data must be provided as well.")
-            formula_C = "-1 + " + formula_C
-            C = dmatrix(formula_C, data, return_type='dataframe').values
-            R = np.concatenate([R, C], axis=1)
-        if C is not None:
-            C = np.array(C)
-            if C.shape[0] != R.shape[0]:
-                raise ValueError("C and R must have the same number of samples")
-            R = np.concatenate([R, C], axis=1)
-        self.R = R
+            C = dmatrix("-1 + " + formula_C, data, return_type="dataframe").values
 
-        #setting hyperparamaters (optional)
-        self.epoch = epoch; self.batch_size = batch_size
-        self.valid_perc = valid_perc; self.learning_rate = learning_rate
-        self.dropout = dropout; self.step_size = step_size
-        self.architecture_y = architecture_y; self.architecture_z = architecture_z
-        self.bn = bn; self.patience_min = patience_min; self.patience_max = patience_max
-        self.model_dir = model_dir
-        self.conv_layers = conv_layers
+        self.R = self._to_numpy(R)
+        self.Y = self._to_numpy(Y).reshape(-1)
+        self.T = self._to_numpy(T).reshape(-1)
+        if not (len(self.R) == len(self.Y) == len(self.T)):
+            raise ValueError("R, Y, and T must have the same number of samples.")
+
+        self.C = None if C is None else self._to_numpy(C)
+        if self.C is not None:
+            if self.C.ndim == 1:
+                self.C = self.C.reshape(-1, 1)
+            if self.C.ndim != 2:
+                raise ValueError("C must be a 1D or 2D array.")
+            if len(self.C) != len(self.R):
+                raise ValueError("C and R must have the same number of samples.")
+        if not 0 < float(valid_perc) < 1:
+            raise ValueError("valid_perc must be between 0 and 1.")
+
+        self.epochs = normalize_options(epoch, name="epoch", cast=int)
+        self.batch_sizes = normalize_options(batch_size, name="batch_size", cast=int)
+        self.learning_rates = normalize_options(
+            learning_rate, name="learning_rate", cast=float
+        )
+        self.dropouts = normalize_options(dropout, name="dropout", cast=float)
+        self.step_sizes = normalize_options(
+            step_size,
+            name="step_size",
+            cast=lambda value: None if value is None else int(value),
+        )
+        self.architecture_y_options = normalize_architectures(
+            architecture_y, name="architecture_y"
+        )
+        self.architecture_z_options = normalize_architectures(
+            architecture_z, name="architecture_z"
+        )
+        self.bn_options = normalize_options(bn, name="bn", cast=bool)
+
+        if any(value <= 0 for value in self.epochs + self.batch_sizes):
+            raise ValueError("epoch and batch_size values must be positive.")
+        if any(value <= 0 for value in self.learning_rates):
+            raise ValueError("learning_rate values must be positive.")
+        if any(value < 0 or value >= 1 for value in self.dropouts):
+            raise ValueError("dropout values must lie in [0, 1).")
+        if any(value is not None and value <= 0 for value in self.step_sizes):
+            raise ValueError("step_size values must be positive or None.")
+        if int(patience_min) <= 0 or int(patience_max) < int(patience_min):
+            raise ValueError("patience bounds must be positive and ordered.")
+
+        self.valid_perc = float(valid_perc)
+        self.patience_min = int(patience_min)
+        self.patience_max = int(patience_max)
+        self.conv_layers = copy.deepcopy(conv_layers)
         self.conv_activation = conv_activation
+        self.model_dir = model_dir
+        self.random_state = int(random_state)
+        self.verbose = bool(verbose)
 
-    def get_value_or_suggestion(self, name, values, suggest_method):
-        if len(values) == 1:
-            return values[0]
-        else:
-            return suggest_method(name, min(values), max(values))
+        self.study_ = None
+        self.best_trial_ = None
+        self.best_score_ = None
+        self.best_params_ = None
+        self.best_model_ = None
+        self._resolved_params_by_trial: dict[int, dict[str, Any]] = {}
 
-    def objective(self, trial):
-        learning_rate = self.get_value_or_suggestion('learning_rate', self.learning_rate, trial.suggest_loguniform)
-        dropout = self.get_value_or_suggestion('dropout', self.dropout, trial.suggest_float)
-        epoch = trial.suggest_categorical('epoch', self.epoch)
-        step_size = trial.suggest_categorical('step_size', self.step_size)
-        architecture_y = trial.suggest_categorical('architecture_y', self.architecture_y)
-        architecture_z = trial.suggest_categorical('architecture_z', self.architecture_z)
-        bn = trial.suggest_categorical('bn', self.bn)
-        patience = trial.suggest_int('patience', self.patience_min, self.patience_max)
-        conv_layers = trial.suggest_categorical('conv_layers', self.conv_layers)
-        conv_activation = trial.suggest_categorical('conv_activation', self.conv_activation)
-        if isinstance(conv_layers, str):
-            conv_layers = ast.literal_eval(conv_layers)
+    @staticmethod
+    def _to_numpy(value) -> np.ndarray:
+        if isinstance(value, torch.Tensor):
+            return value.detach().cpu().numpy()
+        return np.asarray(value)
 
-        model = TarNet(
-            epochs= ast.literal_eval(epoch), #convert string to integer
-            batch_size= self.batch_size,
-            learning_rate=learning_rate,
-            architecture_y=ast.literal_eval(architecture_y), #convert string to list of integers
-            architecture_z=ast.literal_eval(architecture_z), #convert string to list of integers
-            conv_layers=conv_layers,
-            conv_activation=conv_activation,
-            dropout=dropout,
-            step_size=step_size,
-            bn=bn,
-            patience = patience,
-            min_delta = 0,
-            model_dir=self.model_dir,
+    def _sample_params(self, trial) -> dict[str, Any]:
+        patience = (
+            self.patience_min
+            if self.patience_min == self.patience_max
+            else int(trial.suggest_int("patience", self.patience_min, self.patience_max))
+        )
+        return {
+            "epochs": int(suggest_categorical(trial, "epochs", self.epochs)),
+            "batch_size": int(
+                suggest_categorical(trial, "batch_size", self.batch_sizes)
+            ),
+            "learning_rate": suggest_float(
+                trial, "learning_rate", self.learning_rates, log=True
+            ),
+            "dropout": suggest_float(trial, "dropout", self.dropouts),
+            "step_size": suggest_categorical(trial, "step_size", self.step_sizes),
+            "architecture_y": suggest_architecture(
+                trial, "architecture_y", self.architecture_y_options
+            ),
+            "architecture_z": suggest_architecture(
+                trial, "architecture_z", self.architecture_z_options
+            ),
+            "bn": bool(suggest_categorical(trial, "bn", self.bn_options)),
+            "patience": patience,
+        }
+
+    def _build_model(
+        self,
+        params: dict[str, Any],
+        *,
+        random_state: int,
+        model_dir: str | None,
+    ) -> TarNet:
+        return TarNet(
+            **copy.deepcopy(params),
+            conv_layers=copy.deepcopy(self.conv_layers),
+            conv_activation=self.conv_activation,
+            min_delta=0,
+            model_dir=model_dir,
+            verbose=self.verbose,
+            random_state=random_state,
         )
 
-        model.fit(self.R, self.Y, self.T, valid_perc= self.valid_perc, plot_loss=False)
-        validation_loss = model.validate_step().item()
-        return validation_loss
+    def objective(self, trial) -> float:
+        trial_number = int(getattr(trial, "number", 0))
+        params = self._sample_params(trial)
+        self._resolved_params_by_trial[trial_number] = copy.deepcopy(params)
+        record_resolved_params(trial, params)
+
+        # Hold the initialization and validation split fixed so trials are
+        # compared on the same data rather than on trial-specific holdouts.
+        trial_seed = self.random_state
+        torch.manual_seed(trial_seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(trial_seed)
+        model = self._build_model(params, random_state=trial_seed, model_dir=None)
+        score = model.fit(
+            self.R,
+            self.Y,
+            self.T,
+            C=self.C,
+            valid_perc=self.valid_perc,
+            plot_loss=False,
+            epoch_callback=lambda epoch, loss: report_and_prune(
+                trial, loss, epoch
+            ),
+        )
+        if score is None:
+            score = model.best_valid_loss
+        score = float(score)
+        if not np.isfinite(score):
+            raise ValueError("TarNet produced a non-finite validation loss.")
+        return score
+
+    def _set_best_from_study(self, study) -> None:
+        validate_minimize_study(study)
+        best_trial = study.best_trial
+        params = getattr(best_trial, "user_attrs", {}).get("resolved_params")
+        if params is None:
+            params = self._resolved_params_by_trial.get(int(best_trial.number))
+        if params is None:
+            raise ValueError("The best trial does not contain resolved parameters.")
+        self.study_ = study
+        self.best_trial_ = best_trial
+        self.best_score_ = float(best_trial.value)
+        self.best_params_ = copy.deepcopy(params)
+
+    def tune(
+        self,
+        n_trials: int = 50,
+        *,
+        timeout: float | None = None,
+        study=None,
+        sampler=None,
+        pruner=None,
+        n_jobs: int = 1,
+        refit: bool = False,
+        **optimize_kwargs,
+    ):
+        optuna = require_optuna()
+        if study is None:
+            sampler = sampler or optuna.samplers.TPESampler(seed=self.random_state)
+            pruner = pruner or optuna.pruners.MedianPruner(n_startup_trials=5)
+            study = optuna.create_study(
+                direction="minimize", sampler=sampler, pruner=pruner
+            )
+        validate_minimize_study(study)
+        study.optimize(
+            self.objective,
+            n_trials=int(n_trials),
+            timeout=timeout,
+            n_jobs=validate_n_jobs(n_jobs),
+            **optimize_kwargs,
+        )
+        self._set_best_from_study(study)
+        if refit:
+            self.fit_best()
+        return study
+
+    def fit_best(self, study=None) -> TarNet:
+        if study is not None:
+            self._set_best_from_study(study)
+        if self.best_params_ is None:
+            raise RuntimeError("Run tune() or provide a completed study first.")
+        self.best_model_ = self._build_model(
+            self.best_params_,
+            random_state=self.random_state,
+            model_dir=self.model_dir,
+        )
+        self.best_model_.fit(
+            self.R,
+            self.Y,
+            self.T,
+            C=self.C,
+            valid_perc=self.valid_perc,
+            plot_loss=False,
+        )
+        return self.best_model_
 
 def load_hiddens(directory: str, hidden_list: list, prefix: str = None, device: torch.device = "cpu") -> torch.Tensor:
     """

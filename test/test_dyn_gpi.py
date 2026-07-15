@@ -23,8 +23,8 @@ def _sequence_data():
 def test_generic_model_preserves_input_layout_api_and_masks_padding():
     _, r, w, mask = _sequence_data()
     model = DynamicTarNet(
-        architecture_fr=[6],
-        head_hidden=[4],
+        architecture_y=[4, 1],
+        architecture_z=[6],
         batch_size=2,
         verbose=False,
         device="cpu",
@@ -49,8 +49,8 @@ def test_multimodal_model_fuses_video_and_ignores_padded_inputs():
     video_5d = rng.normal(size=(*text.shape[:2], 4, 4, 4))
     video_6d = video_5d[:, :, None, ...]
     model = DynamicTarNet(
-        architecture_fr=[5],
-        head_hidden=[3],
+        architecture_y=[3, 1],
+        architecture_z=[5],
         batch_size=2,
         verbose=False,
         device="cpu",
@@ -104,8 +104,8 @@ def test_multimodal_model_fuses_video_and_ignores_padded_inputs():
 def test_multimodal_shape_and_mask_validation():
     _, text, w, mask = _sequence_data()
     model = DynamicTarNet(
-        architecture_fr=[4],
-        head_hidden=[2],
+        architecture_y=[2, 1],
+        architecture_z=[4],
         verbose=False,
         device="cpu",
         multimodal=True,
@@ -136,7 +136,7 @@ def test_multimodal_shape_and_mask_validation():
             nonbinary_w,
             np.zeros(len(text)),
             np.array([1.0]),
-            nsplits=2,
+            K=2,
             verbose=False,
         )
 
@@ -151,20 +151,62 @@ def test_multimodal_shape_and_mask_validation():
         )
 
 
+@pytest.mark.parametrize(
+    ("n", "batch_size", "valid_perc"),
+    [(5, 4, 0.2), (8, 5, 0.25)],
+)
+def test_dynamic_batch_norm_handles_singleton_remainders(
+    n, batch_size, valid_perc
+):
+    rng = np.random.default_rng(19)
+    t = 2
+    model = DynamicTarNet(
+        architecture_y=[2, 1],
+        architecture_z=[3],
+        epochs=1,
+        batch_size=batch_size,
+        learning_rate=1e-3,
+        dropout=0.0,
+        bn=True,
+        verbose=False,
+        device="cpu",
+    )
+    score = model.fit(
+        rng.normal(size=(n, t, 2)).astype(np.float32),
+        rng.normal(size=n).astype(np.float32),
+        rng.integers(0, 2, size=(n, t)).astype(np.float32),
+        np.ones((n, t), dtype=np.float32),
+        valid_perc=valid_perc,
+        plot_loss=False,
+    )
+
+    assert np.isfinite(score)
+
+
 def test_estimator_uses_one_pipeline_for_vector_and_multimodal_inputs(monkeypatch):
     calls = []
+    init_kwargs = []
     masks_seen = []
     treatments_seen = []
 
     class DummyTarNet:
         def __init__(self, **kwargs):
             self.multimodal = kwargs["multimodal"]
+            init_kwargs.append(kwargs.copy())
             calls.append(("init", self.multimodal, kwargs["text_input_dim"]))
 
         def fit(self, R, Y, W, mask, C=None, valid_perc=0.2, plot_loss=True, *, R_video=None):
             assert np.all(np.isfinite(R))
             assert R_video is None or np.all(np.isfinite(R_video))
-            calls.append(("fit", self.multimodal, R.shape, None if R_video is None else R_video.shape))
+            calls.append(
+                (
+                    "fit",
+                    self.multimodal,
+                    R.shape,
+                    None if R_video is None else R_video.shape,
+                    valid_perc,
+                )
+            )
             masks_seen.append(mask.copy())
             treatments_seen.append(W.copy())
 
@@ -222,7 +264,16 @@ def test_estimator_uses_one_pipeline_for_vector_and_multimodal_inputs(monkeypatc
         w,
         y,
         np.array([0.5, 2.0]),
-        nsplits=2,
+        K=2,
+        nepoch=7,
+        lr=4e-4,
+        architecture_y=[7, 1],
+        architecture_z=[9, 5],
+        valid_perc=0.25,
+        step_size=2,
+        bn=True,
+        patience=3,
+        min_delta=1e-3,
         verbose=False,
         device="cpu",
         n_boot=128,
@@ -232,7 +283,7 @@ def test_estimator_uses_one_pipeline_for_vector_and_multimodal_inputs(monkeypatc
         w,
         y,
         np.array([0.5, 2.0]),
-        nsplits=2,
+        K=2,
         verbose=False,
         device="cpu",
         n_boot=128,
@@ -265,6 +316,29 @@ def test_estimator_uses_one_pipeline_for_vector_and_multimodal_inputs(monkeypatc
     )
     assert any(call[0] == "fit" and call[1] is False and call[3] is None for call in calls)
     assert any(call[0] == "fit" and call[1] is True and call[3] is not None for call in calls)
+    assert any(
+        call[0] == "fit" and call[1] is False and call[4] == pytest.approx(0.25)
+        for call in calls
+    )
+    explicitly_configured = [
+        kwargs
+        for kwargs in init_kwargs
+        if tuple(kwargs["architecture_y"]) == (7, 1)
+        and tuple(kwargs["architecture_z"]) == (9, 5)
+    ]
+    assert explicitly_configured
+    assert all(kwargs["epochs"] == 7 for kwargs in explicitly_configured)
+    assert all(
+        kwargs["learning_rate"] == pytest.approx(4e-4)
+        for kwargs in explicitly_configured
+    )
+    assert all(kwargs["step_size"] == 2 for kwargs in explicitly_configured)
+    assert all(kwargs["bn"] is True for kwargs in explicitly_configured)
+    assert all(kwargs["patience"] == 3 for kwargs in explicitly_configured)
+    assert all(
+        kwargs["min_delta"] == pytest.approx(1e-3)
+        for kwargs in explicitly_configured
+    )
 
     calls.clear()
     without_bootstrap = dyn_gpi.estimate_k_ipsi(
@@ -272,7 +346,7 @@ def test_estimator_uses_one_pipeline_for_vector_and_multimodal_inputs(monkeypatc
         w[:5],
         y[:5],
         np.array([1.0]),
-        nsplits=4,
+        K=4,
         verbose=False,
         device="cpu",
     )
@@ -286,7 +360,7 @@ def test_estimator_uses_one_pipeline_for_vector_and_multimodal_inputs(monkeypatc
         w_complete,
         np.zeros(n),
         np.array([1.0]),
-        nsplits=2,
+        K=2,
         verbose=False,
         device="cpu",
         n_boot=16,
@@ -298,11 +372,41 @@ def test_estimator_uses_one_pipeline_for_vector_and_multimodal_inputs(monkeypatc
 def test_estimator_infers_multimodal_mode_from_video():
     signature = inspect.signature(dyn_gpi.estimate_k_ipsi)
     assert list(signature.parameters)[:4] == ["R", "W", "Y", "delta_seq"]
+    for name in ("K", "nepoch", "lr", "architecture_y", "architecture_z"):
+        assert name in signature.parameters
+    for legacy_name in (
+        "nsplits",
+        "epochs",
+        "learning_rate",
+        "architecture_fr",
+        "head_hidden",
+    ):
+        assert legacy_name not in signature.parameters
     assert "mask" not in signature.parameters
     assert "multimodal" not in signature.parameters
     assert signature.parameters["n_boot"].kind is inspect.Parameter.KEYWORD_ONLY
     assert signature.parameters["n_boot"].default == 0
     assert signature.parameters["R_video"].kind is inspect.Parameter.KEYWORD_ONLY
+
+    model_signature = inspect.signature(dyn_gpi.DynamicTarNet)
+    assert "architecture_y" in model_signature.parameters
+    assert "architecture_z" in model_signature.parameters
+    assert "include_Si_in_head" in model_signature.parameters
+    assert "include_Si_in_rep" in model_signature.parameters
+    assert "architecture_fr" not in model_signature.parameters
+    assert "head_hidden" not in model_signature.parameters
+    assert "include_Ti_in_head" not in model_signature.parameters
+    assert "include_Ti_in_rep" not in model_signature.parameters
+
+    base_signature = inspect.signature(dyn_gpi.DynamicTarNetBase)
+    assert "sizes_y" in base_signature.parameters
+    assert "sizes_z" in base_signature.parameters
+    assert "include_Si_in_head" in base_signature.parameters
+    assert "include_Si_in_rep" in base_signature.parameters
+    assert "architecture_fr" not in base_signature.parameters
+    assert "head_hidden" not in base_signature.parameters
+    assert "include_Ti_in_head" not in base_signature.parameters
+    assert "include_Ti_in_rep" not in base_signature.parameters
 
 
 @pytest.mark.parametrize("n_boot", [-1, True, 1.5])
@@ -333,6 +437,6 @@ def test_estimator_rejects_invalid_nan_padding(w, message):
             w,
             np.zeros(len(w)),
             np.array([1.0]),
-            nsplits=2,
+            K=2,
             verbose=False,
         )

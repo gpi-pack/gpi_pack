@@ -57,7 +57,9 @@ class TarNetBase(nn.Module):
         for out_size in sizes:
             layers.append(nn.LazyLinear(out_features=out_size))
             if self.bn:
-                layers.append(nn.BatchNorm1d(out_size, track_running_stats=False))
+                # Running statistics make evaluation well-defined even when
+                # the validation loader ends with a single observation.
+                layers.append(nn.BatchNorm1d(out_size, track_running_stats=True))
             layers.append(nn.ReLU())
             if dropout is not None:
                 layers.append(nn.Dropout(p=dropout))

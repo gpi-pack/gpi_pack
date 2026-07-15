@@ -2,7 +2,13 @@ from .TarNet import *
 from .TNutil import *
 from .llm import *
 from .diffusion import *
-from .dyn_gpi import DynamicTarNet, DynamicTarNetBase, estimate_k_ipsi
+from .dyn_gpi import (
+    DynamicGPIHyperparameterTuner,
+    DynamicTarNet,
+    DynamicTarNetBase,
+    DynamicTarNetHyperparameterTuner,
+    estimate_k_ipsi,
+)
 from .video import (
     CosmosVideoExtractor,
     VideoExtractionResult,

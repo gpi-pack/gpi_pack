@@ -4,7 +4,7 @@ from __future__ import annotations
 import copy
 import os
 import time
-from typing import Any, Dict, Optional, Sequence, Union
+from typing import Any, Callable, Dict, Optional, Sequence, Union
 
 import numpy as np
 from tqdm import tqdm
@@ -18,9 +18,22 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, RandomSampler, SequentialSampler, TensorDataset
 
+from ._tuning import (
+    normalize_architectures,
+    normalize_options,
+    record_resolved_params,
+    report_and_prune,
+    require_optuna,
+    suggest_architecture,
+    suggest_categorical,
+    suggest_float,
+    validate_minimize_study,
+    validate_n_jobs,
+)
+
 
 class TextMLPEncoder(nn.Module):
-    """Encode a vector representation independently at each sequence step."""
+    """Encode a vector representation independently for each segment."""
 
     def __init__(
         self,
@@ -48,7 +61,7 @@ class TextMLPEncoder(nn.Module):
 
 
 class Video3DEncoder(nn.Module):
-    """Encode a pooled video latent tensor ``[C, D, H, W]`` per step."""
+    """Encode a pooled video latent tensor ``[C, D, H, W]`` per segment."""
 
     def __init__(
         self,
@@ -93,13 +106,13 @@ class DynamicTarNetBase(nn.Module):
 
     def __init__(
         self,
-        architecture_fr: Sequence[int],
-        head_hidden: Sequence[int],
+        sizes_z: Sequence[int],
+        sizes_y: Sequence[int],
         outcome_dim: int = 1,
         dropout: float | None = None,
         bn: bool = False,
-        include_Ti_in_head: bool = True,
-        include_Ti_in_rep: bool = False,
+        include_Si_in_head: bool = True,
+        include_Si_in_rep: bool = False,
         include_C_in_head: bool = True,
         include_C_in_rep: bool = False,
         multimodal: bool = False,
@@ -111,10 +124,20 @@ class DynamicTarNetBase(nn.Module):
         video_out_dim: int = 128,
     ):
         super().__init__()
+        sizes_z = tuple(int(width) for width in sizes_z)
+        sizes_y = tuple(int(width) for width in sizes_y)
+        if not sizes_z or any(width <= 0 for width in sizes_z):
+            raise ValueError("sizes_z must contain positive layer widths.")
+        if not sizes_y or any(width <= 0 for width in sizes_y):
+            raise ValueError("sizes_y must contain positive layer widths.")
+        if sizes_y[-1] != int(outcome_dim):
+            raise ValueError(
+                f"The final sizes_y width must equal outcome_dim={outcome_dim}."
+            )
         self.bn = bn
         self.dropout = dropout
-        self.include_Ti_in_head = include_Ti_in_head
-        self.include_Ti_in_rep = include_Ti_in_rep
+        self.include_Si_in_head = include_Si_in_head
+        self.include_Si_in_rep = include_Si_in_rep
         self.include_C_in_head = include_C_in_head
         self.include_C_in_rep = include_C_in_rep
         self.multimodal = bool(multimodal)
@@ -139,9 +162,11 @@ class DynamicTarNetBase(nn.Module):
             self.text_encoder = None
             self.video_encoder = None
 
-        self.model_fr = self._build_mlp(architecture_fr, dropout, bn)
+        # Keep the registered module names for checkpoint compatibility while
+        # using the same sizes_z/sizes_y convention as TNutil.TarNetBase.
+        self.model_fr = self._build_mlp(sizes_z, dropout, bn)
         self.model_outcome = self._build_mlp(
-            [*head_hidden, outcome_dim], dropout, bn, last_linear=True
+            sizes_y, dropout, bn, last_linear=True
         )
 
     def _build_mlp(self, layer_sizes, dropout, bn, last_linear=False):
@@ -219,7 +244,7 @@ class DynamicTarNetBase(nn.Module):
         w = w.to(device=r.device, dtype=r.dtype)
         mask_f = mask_bool.to(dtype=r.dtype)
 
-        Ti = mask_f.sum(dim=1, keepdim=True)
+        Si = mask_f.sum(dim=1, keepdim=True)
         s = (torch.arange(T, device=r.device, dtype=r.dtype) + 1.0).view(1, T, 1).expand(B, T, 1)
 
         c_time = None
@@ -256,9 +281,9 @@ class DynamicTarNetBase(nn.Module):
 
         r = r.masked_fill(~mask_bool.unsqueeze(-1), 0.0)
         rep_parts = [r, s]
-        if self.include_Ti_in_rep:
-            Ti_rep = Ti.view(B, 1, 1).expand(B, T, 1)
-            rep_parts.append(Ti_rep)
+        if self.include_Si_in_rep:
+            Si_rep = Si.view(B, 1, 1).expand(B, T, 1)
+            rep_parts.append(Si_rep)
 
         if self.include_C_in_rep:
             if c_time is not None:
@@ -279,8 +304,8 @@ class DynamicTarNetBase(nn.Module):
             head_parts.append(c_time.reshape(B, -1))
         if self.include_C_in_head and (c_static is not None):
             head_parts.append(c_static)
-        if self.include_Ti_in_head:
-            head_parts.append(Ti)
+        if self.include_Si_in_head:
+            head_parts.append(Si)
 
         x_out = torch.cat(head_parts, dim=1)
         y_pred = self.model_outcome(x_out)
@@ -305,20 +330,21 @@ class DynamicTarNet:
       Y: [N] or [N,1]
 
     With ``multimodal=True``, ``R`` is the vector/text modality [N,T,F] and
-    ``R_video`` supplies an aligned video modality [N,T,C,D,H,W] (or [N,T,D,H,W]
-    for a single input channel). The two modalities are encoded and fused before
-    the same DynamicTarNet representation and outcome heads are applied.
+    ``R_video`` supplies an aligned video modality [N,T,C_video,D,H,W] (or
+    [N,T,D,H,W] for a single input channel). The two modalities are encoded and
+    fused before the same DynamicTarNet representation and outcome heads are
+    applied.
 
     Optional:
       C (structured confounders):
-        - time-varying: [N,T,C] or [C,N,T] or scalar [N,T]
+        - segment-varying: [N,T,C] or [C,N,T] or scalar [N,T]
         - static:       [N,C] or scalar [N]
     """
 
     def __init__(
         self,
-        architecture_fr: Sequence[int],
-        head_hidden: Sequence[int],
+        architecture_y: Sequence[int] = (16, 1),
+        architecture_z: Sequence[int] = (64, 32),
         outcome_dim: int = 1,
         epochs: int = 200,
         batch_size: int = 32,
@@ -330,8 +356,9 @@ class DynamicTarNet:
         min_delta: float = 0.01,
         model_dir: str | None = None,
         verbose: bool = True,
-        include_Ti_in_head: bool = True,
-        include_Ti_in_rep: bool = False,
+        random_state: int = 42,
+        include_Si_in_head: bool = True,
+        include_Si_in_rep: bool = False,
         include_C_in_head: bool = True,
         include_C_in_rep: bool = False,
         device: str | torch.device | None = "auto",
@@ -357,14 +384,23 @@ class DynamicTarNet:
         self.min_delta = min_delta
         self.model_dir = model_dir
         self.verbose = verbose
+        self.random_state = int(random_state)
 
-        self.architecture_fr = tuple(int(h) for h in architecture_fr)
-        self.head_hidden = tuple(int(h) for h in head_hidden)
+        self.architecture_y = tuple(int(h) for h in architecture_y)
+        self.architecture_z = tuple(int(h) for h in architecture_z)
+        if not self.architecture_z or any(h <= 0 for h in self.architecture_z):
+            raise ValueError("architecture_z must contain positive layer widths.")
+        if not self.architecture_y or any(h <= 0 for h in self.architecture_y):
+            raise ValueError("architecture_y must contain positive layer widths.")
+        if self.architecture_y[-1] != int(outcome_dim):
+            raise ValueError(
+                f"The final architecture_y width must equal outcome_dim={outcome_dim}."
+            )
         self.outcome_dim = outcome_dim
         self.dropout = dropout
         self.bn = bn
-        self.include_Ti_in_head = include_Ti_in_head
-        self.include_Ti_in_rep = include_Ti_in_rep
+        self.include_Si_in_head = include_Si_in_head
+        self.include_Si_in_rep = include_Si_in_rep
         self.include_C_in_head = include_C_in_head
         self.include_C_in_rep = include_C_in_rep
         self.device_spec = device
@@ -376,6 +412,9 @@ class DynamicTarNet:
         self.video_channels = tuple(int(c) for c in video_channels)
         self.video_out_dim = int(video_out_dim)
 
+        torch.manual_seed(self.random_state)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(self.random_state)
         self.model = self._build_model()
 
         self.optim = torch.optim.AdamW(self.model.parameters(), lr=learning_rate, eps=1e-8)
@@ -383,12 +422,13 @@ class DynamicTarNet:
         self.scheduler = None
         if self.step_size is not None:
             self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-                self.optim, mode="min", factor=0.5, patience=5
+                self.optim, mode="min", factor=0.5, patience=int(self.step_size)
             )
 
         self.train_dataloader = None
         self.valid_dataloader = None
         self.valid_loss = None
+        self.best_valid_loss = None
         self._has_c = False
 
         if self.model_dir is not None and self.model_dir != "" and (not os.path.exists(self.model_dir)):
@@ -396,13 +436,13 @@ class DynamicTarNet:
 
     def _build_model(self) -> DynamicTarNetBase:
         return DynamicTarNetBase(
-            architecture_fr=self.architecture_fr,
-            head_hidden=self.head_hidden,
+            sizes_z=self.architecture_z,
+            sizes_y=self.architecture_y,
             outcome_dim=self.outcome_dim,
             dropout=self.dropout,
             bn=self.bn,
-            include_Ti_in_head=self.include_Ti_in_head,
-            include_Ti_in_rep=self.include_Ti_in_rep,
+            include_Si_in_head=self.include_Si_in_head,
+            include_Si_in_rep=self.include_Si_in_rep,
             include_C_in_head=self.include_C_in_head,
             include_C_in_rep=self.include_C_in_rep,
             multimodal=self.multimodal,
@@ -420,7 +460,7 @@ class DynamicTarNet:
         self.scheduler = None
         if self.step_size is not None:
             self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-                self.optim, mode="min", factor=0.5, patience=5
+                self.optim, mode="min", factor=0.5, patience=int(self.step_size)
             )
 
     def _to_tensor(self, x: Union[np.ndarray, torch.Tensor], name: str) -> torch.Tensor:
@@ -470,7 +510,7 @@ class DynamicTarNet:
                 R_video = R_video.unsqueeze(2)
             if R_video.ndim != 6:
                 raise ValueError(
-                    "R_video must be [N,T,C,D,H,W] or [N,T,D,H,W]; "
+                    "R_video must be [N,T,C_video,D,H,W] or [N,T,D,H,W]; "
                     f"got {tuple(R_video.shape)}"
                 )
             if R_video.shape[:2] != (N, T):
@@ -518,7 +558,7 @@ class DynamicTarNet:
                     pass
                 else:
                     raise ValueError(
-                        f"C 2D must be [N,T] (scalar time-varying) or [N,C] (static); got {tuple(C.shape)}"
+                        f"C 2D must be [N,T] (scalar segment-varying) or [N,C] (static); got {tuple(C.shape)}"
                     )
 
             elif C.ndim == 1:
@@ -539,7 +579,7 @@ class DynamicTarNet:
         if torch.any(~torch.isfinite(w_observed)) or torch.any(
             (w_observed != 0) & (w_observed != 1)
         ):
-            raise ValueError("W must be finite and binary at every valid sequence step.")
+            raise ValueError("W must be finite and binary at every valid segment.")
 
         R = R.float()
         R_video = R_video.float() if R_video is not None else None
@@ -605,8 +645,22 @@ class DynamicTarNet:
                 train_dataset = TensorDataset(Rtr, Wtr, Ctr, Mtr, Ytr)
                 valid_dataset = TensorDataset(Rte, Wte, Cte, Mte, Yte)
 
+        train_batch_size = min(int(self.batch_size), len(train_dataset))
+        drop_last = False
+        if self.bn:
+            if train_batch_size < 2:
+                raise ValueError(
+                    "bn=True requires at least two training observations and "
+                    "batch_size >= 2."
+                )
+            drop_last = len(train_dataset) % train_batch_size == 1
+
+        generator = torch.Generator().manual_seed(self.random_state)
         self.train_dataloader = DataLoader(
-            train_dataset, batch_size=self.batch_size, sampler=RandomSampler(train_dataset)
+            train_dataset,
+            batch_size=train_batch_size,
+            sampler=RandomSampler(train_dataset, generator=generator),
+            drop_last=drop_last,
         )
         self.valid_dataloader = DataLoader(
             valid_dataset, batch_size=self.batch_size, sampler=SequentialSampler(valid_dataset)
@@ -623,6 +677,7 @@ class DynamicTarNet:
         plot_loss: bool = True,
         *,
         R_video: Optional[Union[np.ndarray, torch.Tensor]] = None,
+        epoch_callback: Optional[Callable[[int, float], None]] = None,
     ):
         R = self._to_tensor(R, "R")
         Y = self._to_tensor(Y, "Y")
@@ -635,7 +690,9 @@ class DynamicTarNet:
 
         N = W.shape[0]
         idx = np.arange(N)
-        idx_train, idx_test = train_test_split(idx, test_size=valid_perc, random_state=42)
+        idx_train, idx_test = train_test_split(
+            idx, test_size=valid_perc, random_state=self.random_state
+        )
 
         if self.multimodal:
             R_train = R[idx_train, :, :]
@@ -683,11 +740,13 @@ class DynamicTarNet:
         all_training_loss = []
         all_valid_loss = []
         best_loss = float("inf")
+        best_state = None
         epochs_no_improve = 0
 
         for epoch in range(self.epochs):
             self.model.train()
-            loss_list = []
+            training_loss_sum = 0.0
+            training_count = 0
 
             pbar = tqdm(total=len(self.train_dataloader), desc=f"Training (Epoch {epoch})") if self.verbose else None
 
@@ -725,43 +784,48 @@ class DynamicTarNet:
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
                 self.optim.step()
-                loss_list.append(loss.item())
+                training_loss_sum += loss.item() * len(y_b)
+                training_count += len(y_b)
 
             if pbar is not None:
                 pbar.close()
 
-            self.model.eval()
-            valid_loss = self.validate_step()
-            train_loss = float(np.mean(loss_list)) if len(loss_list) else float("nan")
+            valid_loss = float(self.validate_step())
+            train_loss = training_loss_sum / max(training_count, 1)
 
             all_training_loss.append(train_loss)
-            all_valid_loss.append(float(valid_loss))
+            all_valid_loss.append(valid_loss)
 
             if self.verbose:
-                print(f"epoch: {epoch} --- train_loss: {train_loss:.6f} --- valid_loss: {float(valid_loss):.6f}")
+                print(
+                    f"epoch: {epoch} --- train_loss: {train_loss:.6f} "
+                    f"--- valid_loss: {valid_loss:.6f}"
+                )
 
             if self.scheduler is not None:
                 self.scheduler.step(valid_loss)
 
-            if float(valid_loss) + self.min_delta < best_loss:
-                best_loss = float(valid_loss)
+            if valid_loss + self.min_delta < best_loss:
+                best_loss = valid_loss
+                best_state = copy.deepcopy(self.model.state_dict())
                 epochs_no_improve = 0
                 if self.model_dir is not None and self.model_dir != "":
                     torch.save(self.model.state_dict(), os.path.join(self.model_dir, "best_DynamicTarNet.pth"))
             else:
                 epochs_no_improve += 1
 
+            if epoch_callback is not None:
+                epoch_callback(epoch, valid_loss)
+
             if epoch >= 5 and epochs_no_improve >= self.patience:
                 if self.verbose:
                     print(f"Early stopping at epoch {epoch}.")
                 break
 
-        if self.model_dir is not None and self.model_dir != "":
-            path = os.path.join(self.model_dir, "best_DynamicTarNet.pth")
-            if os.path.exists(path):
-                if self.verbose:
-                    print(f"Loading best model from {path}...")
-                self.model.load_state_dict(torch.load(path, map_location=self.device))
+        if best_state is not None:
+            self.model.load_state_dict(best_state)
+        self.best_valid_loss = best_loss
+        self.valid_loss = torch.tensor(best_loss, dtype=torch.float32)
 
         if plot_loss:
             import matplotlib.pyplot as plt
@@ -773,8 +837,13 @@ class DynamicTarNet:
             plt.legend()
             plt.show()
 
+        return float(best_loss)
+
     def validate_step(self) -> torch.Tensor:
-        valid_loss = []
+        was_training = self.model.training
+        self.model.eval()
+        loss_sum = 0.0
+        count = 0
         with torch.no_grad():
             pbar = tqdm(total=len(self.valid_dataloader), desc="Validating") if self.verbose else None
             for batch in self.valid_dataloader:
@@ -807,12 +876,17 @@ class DynamicTarNet:
 
                 y_pred = self.model(r_b, w_b, m_b, c=c_b, r_video=v_b).view(-1)
                 loss = mse_loss(y_b, y_pred)
-                valid_loss.append(loss.item())
+                loss_sum += loss.item() * len(y_b)
+                count += len(y_b)
 
             if pbar is not None:
                 pbar.close()
 
-        self.valid_loss = torch.tensor(valid_loss).mean()
+        if was_training:
+            self.model.train()
+        self.valid_loss = torch.tensor(
+            loss_sum / max(count, 1), dtype=torch.float32
+        )
         return self.valid_loss
 
     def predict(
@@ -1541,20 +1615,440 @@ def _fit_saturated_mean(
     return out.astype(np.float32)
 
 
+def _infer_mask_from_w(W: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Infer a left-aligned sequence mask and zero-fill treatment padding."""
+    W_arr = np.asarray(W, dtype=np.float32)
+    if W_arr.ndim != 2:
+        raise ValueError(f"W must be [N,T], got {W_arr.shape}")
+
+    mask_arr = (~np.isnan(W_arr)).astype(np.float32)
+    if W_arr.shape[1] > 1 and np.any(
+        (mask_arr[:, 1:] > 0) & (mask_arr[:, :-1] == 0)
+    ):
+        raise ValueError(
+            "NaN padding in W must be trailing: observed treatment values "
+            "cannot follow padding."
+        )
+    if np.any(mask_arr.sum(axis=1) == 0):
+        raise ValueError("Each row of W must contain at least one observed treatment.")
+
+    observed = mask_arr > 0
+    if np.any(~np.isfinite(W_arr[observed])) or np.any(
+        ~np.isin(W_arr[observed], (0.0, 1.0))
+    ):
+        raise ValueError("W must be finite and binary at every valid segment.")
+    return np.where(observed, W_arr, 0.0).astype(np.float32), mask_arr
+
+
+class DynamicGPIHyperparameterTuner:
+    """Tune the DynamicTarNet outcome network with Optuna.
+
+    The objective is the best held-out factual-outcome MSE reached during each
+    trial. Returned ``best_params_`` can be passed directly to
+    :func:`estimate_k_ipsi`. Supplying ``R_video`` automatically tunes the
+    multimodal architecture.
+    """
+
+    def __init__(
+        self,
+        R: np.ndarray,
+        W: np.ndarray,
+        Y: np.ndarray,
+        C: Optional[np.ndarray] = None,
+        *,
+        R_video: Optional[np.ndarray] = None,
+        nepoch: Any = (100, 200),
+        batch_size: Any = (16, 32),
+        lr: Any = (1e-5, 1e-3),
+        dropout: Any = (0.0, 0.3),
+        architecture_y: Any = ((16, 1), (32, 16, 1)),
+        architecture_z: Any = ((64, 32), (128, 64)),
+        text_hidden_dims: Any = ((1024, 256),),
+        text_out_dim: Any = (128,),
+        video_channels: Any = ((8, 16, 32),),
+        video_out_dim: Any = (128,),
+        valid_perc: float = 0.2,
+        random_state: int = 42,
+        device: str | torch.device | None = "auto",
+        model_dir: str | None = None,
+        verbose: bool = False,
+    ):
+        self.W, self.mask = _infer_mask_from_w(W)
+        self.Y = np.asarray(Y, dtype=np.float32).reshape(-1)
+        n, t_max = self.W.shape
+        if len(self.Y) != n:
+            raise ValueError(f"Y must have length N={n}; got {self.Y.shape}")
+        if not 0 < float(valid_perc) < 1:
+            raise ValueError("valid_perc must be between 0 and 1.")
+
+        observed = self.mask > 0
+        R_arr = np.asarray(R, dtype=np.float32)
+        if R_arr.ndim != 3:
+            raise ValueError(f"R must be 3D, got {R_arr.shape}")
+
+        self.multimodal = R_video is not None
+        self.R_video = None
+        if self.multimodal:
+            if R_arr.shape[:2] == (n, t_max):
+                pass
+            elif R_arr.shape[1:] == (n, t_max):
+                R_arr = np.transpose(R_arr, (1, 2, 0)).copy()
+            else:
+                raise ValueError(
+                    f"Multimodal R must be [N,T,F] or [F,N,T]; got {R_arr.shape}"
+                )
+            if np.any(~np.isfinite(R_arr[observed])):
+                raise ValueError("R must be finite at every observed segment.")
+            self.R = np.where(observed[:, :, None], R_arr, 0.0).astype(
+                np.float32
+            )
+            self.text_input_dim = int(self.R.shape[2])
+
+            video = np.asarray(R_video, dtype=np.float32)
+            if video.ndim == 5:
+                video = video[:, :, None, :, :, :]
+            if video.ndim != 6 or video.shape[:2] != (n, t_max):
+                raise ValueError(
+                    "R_video must be [N,T,C_video,D,H,W] or [N,T,D,H,W] "
+                    f"aligned with W; got {video.shape}"
+                )
+            if np.any(~np.isfinite(video[observed])):
+                raise ValueError(
+                    "R_video must be finite at every observed segment."
+                )
+            self.R_video = np.where(
+                observed[:, :, None, None, None, None], video, 0.0
+            ).astype(np.float32)
+            self.video_in_channels = int(self.R_video.shape[2])
+        else:
+            if R_arr.shape[:2] == (n, t_max):
+                R_arr = np.transpose(R_arr, (2, 0, 1)).copy()
+            if R_arr.shape[1:] != (n, t_max):
+                raise ValueError(
+                    f"R must be [F,N,T] or [N,T,F] aligned with W; got {R_arr.shape}"
+                )
+            if np.any(~np.isfinite(R_arr[:, observed])):
+                raise ValueError("R must be finite at every observed segment.")
+            self.R = np.where(observed[None, :, :], R_arr, 0.0).astype(
+                np.float32
+            )
+            self.text_input_dim = int(self.R.shape[0])
+            self.video_in_channels = 1
+
+        self.C = None
+        if C is not None:
+            C_arr = np.asarray(C, dtype=np.float32)
+            if C_arr.ndim == 3:
+                if C_arr.shape[:2] == (n, t_max):
+                    pass
+                elif C_arr.shape[1:] == (n, t_max):
+                    C_arr = np.transpose(C_arr, (1, 2, 0)).copy()
+                else:
+                    raise ValueError(
+                        f"C must be [N,T,C] or [C,N,T]; got {C_arr.shape}"
+                    )
+                if np.any(~np.isfinite(C_arr[observed])):
+                    raise ValueError(
+                        "C must be finite at every observed segment."
+                    )
+                self.C = np.where(observed[:, :, None], C_arr, 0.0).astype(
+                    np.float32
+                )
+            elif C_arr.ndim == 2:
+                if C_arr.shape == (n, t_max):
+                    if np.any(~np.isfinite(C_arr[observed])):
+                        raise ValueError(
+                            "C must be finite at every observed segment."
+                        )
+                    self.C = np.where(observed, C_arr, 0.0).astype(np.float32)
+                elif C_arr.shape[0] == n:
+                    if np.any(~np.isfinite(C_arr)):
+                        raise ValueError("Static C must contain only finite values.")
+                    self.C = C_arr
+                else:
+                    raise ValueError(f"C must be [N,T] or [N,C]; got {C_arr.shape}")
+            elif C_arr.ndim == 1:
+                if C_arr.shape[0] != n:
+                    raise ValueError(
+                        f"C 1D must have length N={n}; got {C_arr.shape}"
+                    )
+                if np.any(~np.isfinite(C_arr)):
+                    raise ValueError("Static C must contain only finite values.")
+                self.C = C_arr.reshape(n, 1)
+            else:
+                raise ValueError("C must be 1D, 2D, or 3D.")
+
+        self.nepoch_options = normalize_options(
+            nepoch, name="nepoch", cast=int
+        )
+        self.batch_size_options = normalize_options(
+            batch_size, name="batch_size", cast=int
+        )
+        self.lr_options = normalize_options(
+            lr, name="lr", cast=float
+        )
+        self.dropout_options = normalize_options(
+            dropout, name="dropout", cast=float
+        )
+        self.architecture_y_options = normalize_architectures(
+            architecture_y, name="architecture_y"
+        )
+        self.architecture_z_options = normalize_architectures(
+            architecture_z, name="architecture_z"
+        )
+        if any(values[-1] != 1 for values in self.architecture_y_options):
+            raise ValueError(
+                "Each architecture_y candidate must end in 1 for scalar Y."
+            )
+        self.text_hidden_dims_options = normalize_architectures(
+            text_hidden_dims, name="text_hidden_dims"
+        )
+        self.text_out_dim_options = normalize_options(
+            text_out_dim, name="text_out_dim", cast=int
+        )
+        self.video_channels_options = normalize_architectures(
+            video_channels, name="video_channels"
+        )
+        self.video_out_dim_options = normalize_options(
+            video_out_dim, name="video_out_dim", cast=int
+        )
+
+        if self.multimodal:
+            min_spatial_size = min(self.R_video.shape[-3:])
+            for channels in self.video_channels_options:
+                required_size = 2 ** max(0, len(channels) - 1)
+                if min_spatial_size < required_size:
+                    raise ValueError(
+                        f"video_channels={list(channels)} requires each spatial "
+                        f"dimension of R_video to be at least {required_size}; "
+                        f"got {self.R_video.shape[-3:]}"
+                    )
+
+        if any(
+            value <= 0
+            for value in self.nepoch_options
+            + self.batch_size_options
+            + self.lr_options
+            + self.text_out_dim_options
+            + self.video_out_dim_options
+        ):
+            raise ValueError("Epoch, size, and learning-rate values must be positive.")
+        if any(value < 0 or value >= 1 for value in self.dropout_options):
+            raise ValueError("dropout values must lie in [0, 1).")
+
+        self.valid_perc = float(valid_perc)
+        self.random_state = int(random_state)
+        self.device = device
+        self.model_dir = model_dir
+        self.verbose = bool(verbose)
+
+        self.study_ = None
+        self.best_trial_ = None
+        self.best_score_ = None
+        self.best_params_ = None
+        self.best_model_ = None
+        self._resolved_params_by_trial: dict[int, dict[str, Any]] = {}
+
+    def _sample_params(self, trial) -> dict[str, Any]:
+        params = {
+            "architecture_y": suggest_architecture(
+                trial, "architecture_y", self.architecture_y_options
+            ),
+            "architecture_z": suggest_architecture(
+                trial, "architecture_z", self.architecture_z_options
+            ),
+            "nepoch": int(
+                suggest_categorical(trial, "nepoch", self.nepoch_options)
+            ),
+            "batch_size": int(
+                suggest_categorical(
+                    trial, "batch_size", self.batch_size_options
+                )
+            ),
+            "lr": suggest_float(
+                trial, "lr", self.lr_options, log=True
+            ),
+            "dropout": suggest_float(
+                trial, "dropout", self.dropout_options
+            ),
+        }
+        if self.multimodal:
+            params.update(
+                {
+                    "text_hidden_dims": suggest_architecture(
+                        trial,
+                        "text_hidden_dims",
+                        self.text_hidden_dims_options,
+                    ),
+                    "text_out_dim": int(
+                        suggest_categorical(
+                            trial, "text_out_dim", self.text_out_dim_options
+                        )
+                    ),
+                    "video_channels": suggest_architecture(
+                        trial, "video_channels", self.video_channels_options
+                    ),
+                    "video_out_dim": int(
+                        suggest_categorical(
+                            trial, "video_out_dim", self.video_out_dim_options
+                        )
+                    ),
+                    # Fixed input dimensions are included so best_params_ can
+                    # be passed directly to estimate_k_ipsi, including for
+                    # multi-channel video.
+                    "text_input_dim": self.text_input_dim,
+                    "video_in_channels": self.video_in_channels,
+                }
+            )
+        return params
+
+    def _build_model(
+        self,
+        params: dict[str, Any],
+        *,
+        random_state: int,
+        model_dir: str | None,
+    ) -> DynamicTarNet:
+        model_params = copy.deepcopy(params)
+        model_params["epochs"] = model_params.pop("nepoch")
+        model_params["learning_rate"] = model_params.pop("lr")
+        return DynamicTarNet(
+            **model_params,
+            outcome_dim=1,
+            bn=False,
+            patience=5,
+            min_delta=0,
+            model_dir=model_dir,
+            verbose=self.verbose,
+            random_state=random_state,
+            include_Si_in_head=True,
+            include_Si_in_rep=False,
+            include_C_in_head=self.C is not None,
+            include_C_in_rep=False,
+            device=self.device,
+            multimodal=self.multimodal,
+        )
+
+    def objective(self, trial) -> float:
+        trial_number = int(getattr(trial, "number", 0))
+        params = self._sample_params(trial)
+        self._resolved_params_by_trial[trial_number] = copy.deepcopy(params)
+        record_resolved_params(trial, params)
+
+        # Hold the initialization and validation split fixed so trials are
+        # compared on the same data rather than on trial-specific holdouts.
+        trial_seed = self.random_state
+        model = self._build_model(params, random_state=trial_seed, model_dir=None)
+        score = model.fit(
+            self.R,
+            self.Y,
+            self.W,
+            self.mask,
+            C=self.C,
+            valid_perc=self.valid_perc,
+            plot_loss=False,
+            R_video=self.R_video,
+            epoch_callback=lambda epoch, loss: report_and_prune(
+                trial, loss, epoch
+            ),
+        )
+        if score is None:
+            score = model.best_valid_loss
+        score = float(score)
+        if not np.isfinite(score):
+            raise ValueError("DynamicTarNet produced a non-finite validation loss.")
+        return score
+
+    def _set_best_from_study(self, study) -> None:
+        validate_minimize_study(study)
+        best_trial = study.best_trial
+        params = getattr(best_trial, "user_attrs", {}).get("resolved_params")
+        if params is None:
+            params = self._resolved_params_by_trial.get(int(best_trial.number))
+        if params is None:
+            raise ValueError("The best trial does not contain resolved parameters.")
+        self.study_ = study
+        self.best_trial_ = best_trial
+        self.best_score_ = float(best_trial.value)
+        self.best_params_ = copy.deepcopy(params)
+
+    def tune(
+        self,
+        n_trials: int = 50,
+        *,
+        timeout: float | None = None,
+        study=None,
+        sampler=None,
+        pruner=None,
+        n_jobs: int = 1,
+        refit: bool = False,
+        **optimize_kwargs,
+    ):
+        optuna = require_optuna()
+        if study is None:
+            sampler = sampler or optuna.samplers.TPESampler(seed=self.random_state)
+            pruner = pruner or optuna.pruners.MedianPruner(n_startup_trials=5)
+            study = optuna.create_study(
+                direction="minimize", sampler=sampler, pruner=pruner
+            )
+        validate_minimize_study(study)
+        study.optimize(
+            self.objective,
+            n_trials=int(n_trials),
+            timeout=timeout,
+            n_jobs=validate_n_jobs(n_jobs),
+            **optimize_kwargs,
+        )
+        self._set_best_from_study(study)
+        if refit:
+            self.fit_best()
+        return study
+
+    def fit_best(self, study=None) -> DynamicTarNet:
+        if study is not None:
+            self._set_best_from_study(study)
+        if self.best_params_ is None:
+            raise RuntimeError("Run tune() or provide a completed study first.")
+        self.best_model_ = self._build_model(
+            self.best_params_,
+            random_state=self.random_state,
+            model_dir=self.model_dir,
+        )
+        self.best_model_.fit(
+            self.R,
+            self.Y,
+            self.W,
+            self.mask,
+            C=self.C,
+            valid_perc=self.valid_perc,
+            plot_loss=False,
+            R_video=self.R_video,
+        )
+        return self.best_model_
+
+
+DynamicTarNetHyperparameterTuner = DynamicGPIHyperparameterTuner
+
+
 def estimate_k_ipsi(
     R: np.ndarray,
     W: np.ndarray,
     Y: np.ndarray,
     delta_seq: np.ndarray,
-    nsplits: int = 5,
+    K: int = 5,
     sample_split_only: bool = False,
     sample_split_fold: int = 1,
-    architecture_fr: list[int] = [64, 32],
-    head_hidden: list[int] = [16],
-    epochs: int = 200,
+    architecture_y: Sequence[int] = (16, 1),
+    architecture_z: Sequence[int] = (64, 32),
+    nepoch: int = 200,
     batch_size: int = 32,
-    learning_rate: float = 2e-5,
+    lr: float = 2e-5,
     dropout: float = 0.3,
+    valid_perc: float = 0.2,
+    step_size: int | None = None,
+    bn: bool = False,
+    patience: int = 5,
+    min_delta: float = 0,
     verbose: bool = True,
     random_state: int = 42,
     eps_prob: float | None = 1e-6,
@@ -1583,15 +2077,162 @@ def estimate_k_ipsi(
     video_channels: Sequence[int] = (8, 16, 32),
     video_out_dim: int = 128,
 ) -> Dict[str, Any]:
-    """
-    Estimate the incremental-intervention curve with cross-fitting.
+    """Estimate a longitudinal incremental-intervention curve by cross-fitting.
 
-    The sequence mask is inferred from ``W``: finite binary entries are
-    observed and trailing ``NaN`` entries are padding.
-    Supplying ``R_video`` automatically enables multimodal estimation.
-    Set ``n_boot`` to a positive integer to add 95% uniform confidence bands
-    over ``delta_seq`` using a Rademacher multiplier bootstrap.
+    Parameters
+    ----------
+    R : np.ndarray
+        Per-segment vector representations. Vector-only estimation accepts
+        ``[F,N,T]`` or ``[N,T,F]``. With ``R_video``, this is the aligned
+        text/vector modality ``[N,T,F]`` (``[F,N,T]`` is also accepted).
+    W : np.ndarray
+        Binary treatment history ``[N,T]``. Finite 0/1 entries are observed;
+        trailing ``NaN`` entries are padding and determine the sequence mask.
+    Y : np.ndarray
+        One scalar outcome per unit, shape ``[N]`` or ``[N,1]``.
+    delta_seq : array-like
+        Positive intervention odds multipliers. Supply a scalar or ``[J]`` to
+        apply each multiplier at every observed segment, or ``[J,T]`` for
+        segment-specific intervention schedules.
+    K : int, default=5
+        Number of cross-fitting folds.
+    sample_split_only : bool, default=False
+        If true, estimate only the fold selected by ``sample_split_fold``.
+    sample_split_fold : int, default=1
+        One-indexed held-out fold used when ``sample_split_only=True``.
+    architecture_y : sequence of int, default=(16, 1)
+        Outcome-network layer widths. As in :class:`TarNet`, the final width is
+        the output dimension and must be 1 for the supported scalar outcome.
+    architecture_z : sequence of int, default=(64, 32)
+        Shared/deconfounder representation layer widths. The final width is the
+        learned representation dimension for each segment.
+    nepoch : int, default=200
+        Maximum DynamicTarNet training epochs per fold.
+    batch_size : int, default=32
+        DynamicTarNet training batch size.
+    lr : float, default=2e-5
+        DynamicTarNet learning rate.
+    dropout : float, default=0.3
+        Dropout probability in the representation and outcome networks.
+    valid_perc : float, default=0.2
+        Fraction of each training fold used for neural-network validation.
+    step_size : int, optional
+        Patience of the reduce-on-plateau learning-rate scheduler. ``None``
+        disables that scheduler.
+    bn : bool, default=False
+        Whether to use batch normalization in DynamicTarNet.
+    patience : int, default=5
+        Early-stopping patience in epochs.
+    min_delta : float, default=0
+        Minimum validation-loss improvement used by early stopping.
+    verbose : bool, default=True
+        Whether to print fold and training progress.
+    random_state : int, default=42
+        Seed used for fold assignment and neural-network training.
+    eps_prob : float or None, default=1e-6
+        Optional lower/upper clipping tolerance for estimated probabilities.
+    nn_hidden : sequence of int, default=(64, 32)
+        Hidden widths for the downstream propensity and regression MLPs.
+    nn_alpha : float, default=1e-4
+        Weight-decay strength for downstream MLPs.
+    nn_lr : float, default=1e-3
+        Learning rate for downstream MLPs.
+    nn_lr_scheduler : str, default="none"
+        Downstream learning-rate policy: ``"none"`` or ``"adaptive"``
+        (aliases ``"plateau"`` and ``"reduce_on_plateau"`` are accepted).
+    nn_lr_scheduler_factor : float, default=0.5
+        Multiplicative factor for the downstream adaptive scheduler.
+    nn_lr_scheduler_patience : int, default=2
+        Plateau patience for the downstream adaptive scheduler.
+    nn_lr_scheduler_min_lr : float, default=1e-6
+        Minimum downstream learning rate.
+    nn_max_iter : int, default=300
+        Maximum downstream MLP training epochs.
+    nn_patience : int, default=5
+        Early-stopping patience for downstream MLPs.
+    nn_batch_size : int or "auto", default="auto"
+        Batch size for downstream MLPs.
+    nn_dropout : float, default=0
+        Dropout probability for downstream MLPs.
+    H : np.ndarray, optional
+        Precomputed longitudinal representations ``[N,T,d_z]`` or
+        ``[d_z,N,T]``. When supplied, DynamicTarNet representation learning is
+        skipped.
+    C : np.ndarray, optional
+        Static confounders ``[N,P]``/``[N]`` or segment-varying confounders
+        ``[N,T,P]``/``[P,N,T]``/``[N,T]``.
+    model_dir : str, optional
+        Existing directory under which fold-specific checkpoints are stored.
+    device : str, torch.device, or None, default="auto"
+        Device for DynamicTarNet and downstream MLPs.
+    n_boot : int, default=0
+        Number of Rademacher multiplier-bootstrap draws. A positive value adds
+        simultaneous 95% bands ``ll2`` and ``ul2``; both are ``None`` at zero.
+    R_video : np.ndarray, optional
+        Aligned video representations ``[N,T,D,H,W]`` or
+        ``[N,T,C_video,D,H,W]``. Here ``T`` is the common padded number of
+        segment positions, while unit ``i`` has ``S_i`` observed segments. For
+        an unpooled Cosmos representation, ``D`` is retained latent time within
+        each segment. Its presence enables multimodal mode.
+    text_input_dim : int, optional
+        Text/vector feature width. Inferred from ``R`` when omitted.
+    text_hidden_dims : sequence of int, default=(1024, 256)
+        Hidden widths of the per-segment text encoder.
+    text_out_dim : int, default=128
+        Encoded text feature width.
+    video_in_channels : int, default=1
+        ``C_video`` for six-dimensional ``R_video``; use 1 for five-dimensional
+        ``R_video``.
+    video_channels : sequence of int, default=(8, 16, 32)
+        Channel widths of the 3D video encoder.
+    video_out_dim : int, default=128
+        Encoded video feature width.
+
+    Returns
+    -------
+    dict
+        ``est`` and ``se`` contain the estimated curve and standard errors;
+        ``ll1``/``ul1`` are pointwise 95% intervals; ``ll2``/``ul2`` are
+        simultaneous 95% bands when requested; ``ifvals`` is the ``[N,J]``
+        influence-function matrix. The dictionary also contains ``delta``,
+        expanded ``delta_paths``, ``sigma``, and ``n_eff``.
+
+    Notes
+    -----
+    Dimension notation is: ``N`` units, ``T`` padded segment positions,
+    ``S_i`` observed segments for unit ``i``, ``F`` vector/text features,
+    ``C_video`` video channels, ``D`` video depth, ``H``/``W`` latent spatial
+    dimensions, ``P`` covariates, ``d_z`` learned representation features,
+    ``J`` interventions, and ``K`` cross-fitting folds. For unpooled Cosmos
+    features, ``D`` equals latent time within a segment and is distinct from
+    the outer segment axis ``T``.
+    A finite zero in ``W`` is an observed control treatment, not padding.
+    This function supports one scalar outcome per unit; it does not implement
+    inference for repeated outcomes shaped ``[N,T]``.
     """
+
+    architecture_y = tuple(int(width) for width in architecture_y)
+    architecture_z = tuple(int(width) for width in architecture_z)
+    if not architecture_y or any(width <= 0 for width in architecture_y):
+        raise ValueError("architecture_y must contain positive layer widths.")
+    if architecture_y[-1] != 1:
+        raise ValueError("architecture_y must end in 1 for scalar Y.")
+    if not architecture_z or any(width <= 0 for width in architecture_z):
+        raise ValueError("architecture_z must contain positive layer widths.")
+    if int(nepoch) <= 0 or int(batch_size) <= 0:
+        raise ValueError("nepoch and batch_size must be positive.")
+    if float(lr) <= 0:
+        raise ValueError("lr must be positive.")
+    if not 0 <= float(dropout) < 1:
+        raise ValueError("dropout must lie in [0, 1).")
+    if not 0 < float(valid_perc) < 1:
+        raise ValueError("valid_perc must lie strictly between 0 and 1.")
+    if step_size is not None and int(step_size) <= 0:
+        raise ValueError("step_size must be positive or None.")
+    if int(patience) <= 0:
+        raise ValueError("patience must be positive.")
+    if float(min_delta) < 0:
+        raise ValueError("min_delta must be nonnegative.")
 
     if (
         isinstance(n_boot, (bool, np.bool_))
@@ -1623,20 +2264,22 @@ def estimate_k_ipsi(
             os.makedirs(save_dir, exist_ok=True)
 
         model = DynamicTarNet(
-            architecture_fr=architecture_fr,
-            head_hidden=head_hidden,
+            architecture_y=architecture_y,
+            architecture_z=architecture_z,
             outcome_dim=1,
-            epochs=epochs,
+            epochs=nepoch,
             batch_size=batch_size,
-            learning_rate=learning_rate,
+            learning_rate=lr,
             dropout=dropout,
-            bn=False,
-            patience=5,
-            min_delta=0,
+            bn=bn,
+            step_size=step_size,
+            patience=patience,
+            min_delta=min_delta,
             model_dir=save_dir,
             verbose=verbose,
-            include_Ti_in_head=True,
-            include_Ti_in_rep=False,
+            random_state=random_state,
+            include_Si_in_head=True,
+            include_Si_in_rep=False,
             include_C_in_head=(C is not None),
             include_C_in_rep=False,
             device=device,
@@ -1650,7 +2293,7 @@ def estimate_k_ipsi(
         )
 
         n_sub = int(W_sub.shape[0])
-        valid_perc_nn = 0.2
+        valid_perc_nn = valid_perc
         if n_sub < 2:
             raise ValueError(f"Cannot train NN on n={n_sub} samples.")
         if n_sub == 2:
@@ -1838,14 +2481,13 @@ def estimate_k_ipsi(
         n_tr, T_max_local = W_tr.shape
         n_te = W_te.shape[0]
 
-        T_tr = mask_tr.sum(axis=1).astype(int)
-        T_te = mask_te.sum(axis=1).astype(int)
+        n_segments_tr = mask_tr.sum(axis=1).astype(int)
 
         R_tr_rec = np.full((n_tr, T_max_local + 1), np.nan, dtype=np.float32)
         for i in range(n_tr):
-            Ti = int(T_tr[i])
-            if Ti > 0:
-                R_tr_rec[i, Ti] = float(mu_tr[i])
+            Si = int(n_segments_tr[i])
+            if Si > 0:
+                R_tr_rec[i, Si] = float(mu_tr[i])
 
         m1_te_all = np.full((n_te, T_max_local), np.nan, dtype=np.float32)
         m0_te_all = np.full((n_te, T_max_local), np.nan, dtype=np.float32)
@@ -1856,22 +2498,24 @@ def estimate_k_ipsi(
         prod_omega_tr = np.ones(n_tr, dtype=np.float64)
         clip_eps = float(eps_prob) if (eps_prob is not None and eps_prob > 0) else None
 
-        for r in range(T_max_local):
-            omega_prev_tr[:, r] = prod_omega_tr.astype(np.float32)
+        for s in range(T_max_local):
+            omega_prev_tr[:, s] = prod_omega_tr.astype(np.float32)
 
-            obs_r = mask_tr[:, r] > 0
-            if obs_r.sum() == 0:
+            obs_s = mask_tr[:, s] > 0
+            if obs_s.sum() == 0:
                 continue
 
-            W_r = W_tr[obs_r, r].astype(np.float64, copy=False)
-            p_r = p_tr[obs_r, r].astype(np.float64, copy=False)
-            pi_raw = pi_tr[obs_r, r].astype(np.float64, copy=False)
+            W_s = W_tr[obs_s, s].astype(np.float64, copy=False)
+            p_s = p_tr[obs_s, s].astype(np.float64, copy=False)
+            pi_raw = pi_tr[obs_s, s].astype(np.float64, copy=False)
 
-            if np.any(~np.isfinite(p_r)) or np.any(~np.isfinite(pi_raw)):
-                raise RuntimeError(f"Non-finite p/pi for training unit at time t={r}.")
+            if np.any(~np.isfinite(p_s)) or np.any(~np.isfinite(pi_raw)):
+                raise RuntimeError(
+                    f"Non-finite p/pi for training unit at segment s={s}."
+                )
 
-            delta_r = float(delta_vec[r])
-            denom_r = delta_r * p_r + 1.0 - p_r
+            delta_s = float(delta_vec[s])
+            denom_s = delta_s * p_s + 1.0 - p_s
 
             pi_w1 = pi_raw.copy()
             pi_w0 = 1.0 - pi_raw
@@ -1882,14 +2526,18 @@ def estimate_k_ipsi(
                 pi_w1 = np.where(pi_w1 <= 0.0, 1e-12, pi_w1)
                 pi_w0 = np.where(pi_w0 <= 0.0, 1e-12, pi_w0)
 
-            omega_r = np.empty_like(p_r, dtype=np.float64)
-            treated = W_r >= 0.5
-            omega_r[treated] = (delta_r * p_r[treated] / pi_w1[treated]) / denom_r[treated]
-            omega_r[~treated] = ((1.0 - p_r[~treated]) / pi_w0[~treated]) / denom_r[~treated]
+            omega_s = np.empty_like(p_s, dtype=np.float64)
+            treated = W_s >= 0.5
+            omega_s[treated] = (
+                delta_s * p_s[treated] / pi_w1[treated]
+            ) / denom_s[treated]
+            omega_s[~treated] = (
+                (1.0 - p_s[~treated]) / pi_w0[~treated]
+            ) / denom_s[~treated]
 
-            prod_obs = prod_omega_tr[obs_r]
-            prod_obs *= omega_r
-            prod_omega_tr[obs_r] = prod_obs
+            prod_obs = prod_omega_tr[obs_s]
+            prod_obs *= omega_s
+            prod_omega_tr[obs_s] = prod_obs
 
         def _mean_or_fallback(v: np.ndarray, obs: np.ndarray, fallback_obs: np.ndarray) -> float:
             if np.any(obs):
@@ -1908,34 +2556,35 @@ def estimate_k_ipsi(
             fit_obs = obs if np.any(obs) else fallback_obs
             return _fit_saturated_mean(y_target, codes, fit_obs, n_codes)
 
-        for t in range(T_max_local - 1, -1, -1):
-            train_obs = mask_tr[:, t] > 0
-            test_obs = mask_te[:, t] > 0
+        for s in range(T_max_local - 1, -1, -1):
+            train_obs = mask_tr[:, s] > 0
+            test_obs = mask_te[:, s] > 0
 
             if train_obs.sum() == 0:
                 continue
 
-            y_out_tr = R_tr_rec[:, t + 1]
+            y_out_tr = R_tr_rec[:, s + 1]
             if not np.all(np.isfinite(y_out_tr[train_obs])):
                 raise RuntimeError(
-                    f"Non-finite training pseudo-outcomes at time t={t} (timewise crossfit)."
+                    f"Non-finite training pseudo-outcomes at segment s={s} "
+                    "(segment-wise cross-fit)."
                 )
 
-            if t == 0:
+            if s == 0:
                 H_upto_tr = H_tr[:, 0, :]
                 W_past_tr = np.zeros((n_tr, 0), dtype=np.float32)
                 H_upto_te = H_te[:, 0, :]
                 W_past_te = np.zeros((n_te, 0), dtype=np.float32)
             else:
-                H_upto_tr = H_tr[:, : t + 1, :].reshape(n_tr, -1)
-                W_past_tr = W_tr[:, :t]
-                H_upto_te = H_te[:, : t + 1, :].reshape(n_te, -1)
-                W_past_te = W_te[:, :t]
+                H_upto_tr = H_tr[:, : s + 1, :].reshape(n_tr, -1)
+                W_past_tr = W_tr[:, :s]
+                H_upto_te = H_te[:, : s + 1, :].reshape(n_te, -1)
+                W_past_te = W_te[:, :s]
 
-            Cout_tr = _c_upto(C_tr_time, C_tr_static, t, n_tr)
-            Cout_te = _c_upto(C_te_time, C_te_static, t, n_te)
+            Cout_tr = _c_upto(C_tr_time, C_tr_static, s, n_tr)
+            Cout_te = _c_upto(C_te_time, C_te_static, s, n_te)
 
-            Wt_tr = W_tr[:, t : t + 1]
+            Wt_tr = W_tr[:, s : s + 1]
             X_tr_out = np.concatenate([S_tr, W_past_tr, H_upto_tr, Cout_tr, Wt_tr], axis=1)
 
             Wt1_tr = np.ones((n_tr, 1), dtype=np.float32)
@@ -1963,7 +2612,7 @@ def estimate_k_ipsi(
                 nn_patience=nn_patience,
                 nn_batch_size=nn_batch_size,
                 nn_dropout=nn_dropout,
-                random_state=int(random_state + 10000 * t),
+                random_state=int(random_state + 10000 * s),
                 device=device,
             )
 
@@ -1973,44 +2622,44 @@ def estimate_k_ipsi(
             if test_obs.sum() > 0:
                 m1_te = reg.predict(X_te_1).astype(np.float32)
                 m0_te = reg.predict(X_te_0).astype(np.float32)
-                m1_te_all[test_obs, t] = m1_te[test_obs]
-                m0_te_all[test_obs, t] = m0_te[test_obs]
+                m1_te_all[test_obs, s] = m1_te[test_obs]
+                m0_te_all[test_obs, s] = m0_te[test_obs]
 
-            mt1_target_tr = (omega_prev_tr[:, t] * m1_tr).astype(np.float32)
-            mt0_target_tr = (omega_prev_tr[:, t] * m0_tr).astype(np.float32)
+            mt1_target_tr = (omega_prev_tr[:, s] * m1_tr).astype(np.float32)
+            mt0_target_tr = (omega_prev_tr[:, s] * m0_tr).astype(np.float32)
 
-            if t == 0:
+            if s == 0:
                 mt1 = _mean_or_fallback(mt1_target_tr, train_obs, train_obs)
                 mt0 = _mean_or_fallback(mt0_target_tr, train_obs, train_obs)
                 if test_obs.sum() > 0:
-                    mtilde1_te_all[test_obs, t] = mt1
-                    mtilde0_te_all[test_obs, t] = mt0
+                    mtilde1_te_all[test_obs, s] = mt1
+                    mtilde0_te_all[test_obs, s] = mt0
             else:
-                n_codes = 2 ** t
+                n_codes = 2 ** s
                 mt1_map = _fit_mtilde_saturated(
                     mt1_target_tr,
-                    codes_tr_all[t],
+                    codes_tr_all[s],
                     train_obs,
                     train_obs,
                     n_codes,
                 )
                 mt0_map = _fit_mtilde_saturated(
                     mt0_target_tr,
-                    codes_tr_all[t],
+                    codes_tr_all[s],
                     train_obs,
                     train_obs,
                     n_codes,
                 )
                 if test_obs.sum() > 0:
-                    mtilde1_te_all[test_obs, t] = mt1_map[codes_te_all[t][test_obs]]
-                    mtilde0_te_all[test_obs, t] = mt0_map[codes_te_all[t][test_obs]]
+                    mtilde1_te_all[test_obs, s] = mt1_map[codes_te_all[s][test_obs]]
+                    mtilde0_te_all[test_obs, s] = mt0_map[codes_te_all[s][test_obs]]
 
-            p_t_tr = p_tr[:, t]
-            delta_t = float(delta_vec[t])
-            denom_tr = delta_t * p_t_tr + 1.0 - p_t_tr
+            p_s_tr = p_tr[:, s]
+            delta_s = float(delta_vec[s])
+            denom_tr = delta_s * p_s_tr + 1.0 - p_s_tr
 
-            R_tr_rec[train_obs, t] = (
-                (delta_t * p_t_tr[train_obs] * m1_tr[train_obs] + (1.0 - p_t_tr[train_obs]) * m0_tr[train_obs])
+            R_tr_rec[train_obs, s] = (
+                (delta_s * p_s_tr[train_obs] * m1_tr[train_obs] + (1.0 - p_s_tr[train_obs]) * m0_tr[train_obs])
                 / denom_tr[train_obs]
             )
 
@@ -2036,58 +2685,62 @@ def estimate_k_ipsi(
         mt0_te: np.ndarray,
     ) -> np.ndarray:
         n_te, _ = W_te.shape
-        T_te = mask_te.sum(axis=1).astype(int)
+        n_segments_te = mask_te.sum(axis=1).astype(int)
 
         psi_vals = np.full(n_te, np.nan, dtype=np.float32)
 
         for i in range(n_te):
-            Ti = int(T_te[i])
-            if Ti <= 0:
+            Si = int(n_segments_te[i])
+            if Si <= 0:
                 continue
 
             prod_omega = 1.0
             acc = 0.0
 
-            for t in range(Ti):
-                Wt = float(W_te[i, t])
+            for s in range(Si):
+                Ws = float(W_te[i, s])
 
-                p_t = float(p_te[i, t])
-                pi_raw = float(pi_te[i, t])
+                p_s = float(p_te[i, s])
+                pi_raw = float(pi_te[i, s])
 
-                if not np.isfinite(p_t) or not np.isfinite(pi_raw):
-                    raise RuntimeError(f"Non-finite p/pi for test unit (i={i}) at t={t}.")
+                if not np.isfinite(p_s) or not np.isfinite(pi_raw):
+                    raise RuntimeError(
+                        f"Non-finite p/pi for test unit (i={i}) at segment s={s}."
+                    )
 
-                delta_t = float(delta_vec[t])
-                denom = delta_t * p_t + 1.0 - p_t
+                delta_s = float(delta_vec[s])
+                denom = delta_s * p_s + 1.0 - p_s
 
-                m1 = float(m1_te[i, t])
-                m0 = float(m0_te[i, t])
-                mt1 = float(mt1_te[i, t])
-                mt0 = float(mt0_te[i, t])
+                m1 = float(m1_te[i, s])
+                m0 = float(m0_te[i, s])
+                mt1 = float(mt1_te[i, s])
+                mt0 = float(mt0_te[i, s])
 
                 if not (np.isfinite(m1) and np.isfinite(m0) and np.isfinite(mt1) and np.isfinite(mt0)):
-                    raise RuntimeError(f"Non-finite m/mtilde for test unit (i={i}) at t={t}.")
+                    raise RuntimeError(
+                        f"Non-finite m/mtilde for test unit (i={i}) at segment s={s}."
+                    )
 
                 clip_eps = float(eps_prob) if (eps_prob is not None and eps_prob > 0) else None
-                if Wt >= 0.5:
+                if Ws >= 0.5:
                     pi_denom = pi_raw
                     if clip_eps is not None:
                         pi_denom = min(max(pi_denom, clip_eps), 1.0 - clip_eps)
                     elif pi_denom <= 0.0:
                         pi_denom = 1e-12
-                    A_num = delta_t * p_t * m1 * (1.0 - 1.0 / pi_denom) + (1.0 - p_t) * m0
-                    omega = (delta_t * p_t / pi_denom) / denom
+                    A_num = delta_s * p_s * m1 * (1.0 - 1.0 / pi_denom) + (1.0 - p_s) * m0
+                    omega = (delta_s * p_s / pi_denom) / denom
                 else:
                     one_minus = 1.0 - pi_raw
                     if clip_eps is not None:
                         one_minus = min(max(one_minus, clip_eps), 1.0 - clip_eps)
                     elif one_minus <= 0.0:
                         one_minus = 1e-12
-                    A_num = delta_t * p_t * m1 + (1.0 - p_t) * m0 * (1.0 - 1.0 / one_minus)
-                    omega = ((1.0 - p_t) / one_minus) / denom
+                    A_num = delta_s * p_s * m1 + (1.0 - p_s) * m0 * (1.0 - 1.0 / one_minus)
+                    omega = ((1.0 - p_s) / one_minus) / denom
 
                 A = A_num / denom
-                B = delta_t * (Wt - p_t) * (mt1 - mt0) / (denom ** 2)
+                B = delta_s * (Ws - p_s) * (mt1 - mt0) / (denom ** 2)
 
                 acc += prod_omega * A + B
                 prod_omega *= omega
@@ -2097,31 +2750,15 @@ def estimate_k_ipsi(
 
         return psi_vals
 
-    W_arr = np.asarray(W, dtype=np.float32)
+    W_arr, mask_arr = _infer_mask_from_w(W)
     Y_arr = np.asarray(Y, dtype=np.float32).reshape(-1)
 
-    if W_arr.ndim != 2:
-        raise ValueError(f"W must be [N,T], got {W_arr.shape}")
     n, T_max = W_arr.shape
 
     if Y_arr.shape[0] != n:
         raise ValueError(f"Y must have length N={n}; got {Y_arr.shape}")
 
-    mask_arr = (~np.isnan(W_arr)).astype(np.float32)
-    if T_max > 1 and np.any((mask_arr[:, 1:] > 0) & (mask_arr[:, :-1] == 0)):
-        raise ValueError(
-            "NaN padding in W must be trailing: observed treatment values "
-            "cannot follow padding."
-        )
-    if np.any(mask_arr.sum(axis=1) == 0):
-        raise ValueError("Each row of W must contain at least one observed treatment.")
-
     observed = mask_arr > 0
-    if np.any(~np.isfinite(W_arr[observed])) or np.any(
-        ~np.isin(W_arr[observed], (0.0, 1.0))
-    ):
-        raise ValueError("W must be finite and binary at every valid sequence step.")
-    W_arr = np.where(observed, W_arr, 0.0).astype(np.float32)
 
     R_arr = np.asarray(R, dtype=np.float32)
     if R_arr.ndim != 3:
@@ -2146,7 +2783,7 @@ def estimate_k_ipsi(
                 f"got {R_arr.shape[2]}"
             )
         if np.any(~np.isfinite(R_arr[observed])):
-            raise ValueError("R must be finite at every observed sequence step.")
+            raise ValueError("R must be finite at every observed segment.")
         R_arr = np.where(observed[:, :, None], R_arr, 0.0).astype(np.float32)
 
         R_video_arr = np.asarray(R_video, dtype=np.float32)
@@ -2154,7 +2791,7 @@ def estimate_k_ipsi(
             R_video_arr = R_video_arr[:, :, None, :, :, :]
         if R_video_arr.ndim != 6:
             raise ValueError(
-                "R_video must be [N,T,C,D,H,W] or [N,T,D,H,W]; "
+                "R_video must be [N,T,C_video,D,H,W] or [N,T,D,H,W]; "
                 f"got {R_video_arr.shape}"
             )
         if R_video_arr.shape[:2] != (n, T_max):
@@ -2168,7 +2805,7 @@ def estimate_k_ipsi(
                 f"video_in_channels={video_in_channels}."
             )
         if np.any(~np.isfinite(R_video_arr[observed])):
-            raise ValueError("R_video must be finite at every observed sequence step.")
+            raise ValueError("R_video must be finite at every observed segment.")
         R_video_arr = np.where(
             observed[:, :, None, None, None, None], R_video_arr, 0.0
         ).astype(np.float32)
@@ -2182,7 +2819,7 @@ def estimate_k_ipsi(
                 f"expected N={n}, T={T_max}"
             )
         if np.any(~np.isfinite(R_arr[:, observed])):
-            raise ValueError("R must be finite at every observed sequence step.")
+            raise ValueError("R must be finite at every observed segment.")
         R_arr = np.where(observed[None, :, :], R_arr, 0.0).astype(np.float32)
         text_input_dim_resolved = int(text_input_dim) if text_input_dim is not None else int(F)
 
@@ -2205,25 +2842,25 @@ def estimate_k_ipsi(
         delta_out = delta_paths
         delta_is_schedule = True
     else:
-        raise ValueError("delta_seq must be scalar, 1D (K,), or 2D (K,T).")
+        raise ValueError("delta_seq must be scalar, 1D (J,), or 2D (J,T).")
 
     k = int(delta_paths.shape[0])
     ifvals = np.full((n, k), np.nan, dtype=float)
     est_eff = np.full(k, np.nan, dtype=float)
 
-    nsplits = int(nsplits)
-    if nsplits < 2:
-        raise ValueError("nsplits must be at least 2.")
-    if nsplits > n:
-        raise ValueError(f"nsplits={nsplits} cannot exceed the number of observations n={n}.")
+    K = int(K)
+    if K < 2:
+        raise ValueError("K must be at least 2.")
+    if K > n:
+        raise ValueError(f"K={K} cannot exceed the number of observations n={n}.")
     sample_split_fold = int(sample_split_fold)
-    if sample_split_fold < 1 or sample_split_fold > nsplits:
-        raise ValueError(f"sample_split_fold must be in [1, nsplits={nsplits}].")
+    if sample_split_fold < 1 or sample_split_fold > K:
+        raise ValueError(f"sample_split_fold must be in [1, K={K}].")
 
     rng = np.random.default_rng(random_state)
-    s = np.tile(np.arange(1, nsplits + 1), int(np.ceil(n / nsplits)))[:n]
+    s = np.tile(np.arange(1, K + 1), int(np.ceil(n / K)))[:n]
     rng.shuffle(s)
-    split_iter = [sample_split_fold] if sample_split_only else range(1, nsplits + 1)
+    split_iter = [sample_split_fold] if sample_split_only else range(1, K + 1)
 
     S_full = mask_arr.sum(axis=1).astype(np.float32)
 
@@ -2240,7 +2877,7 @@ def estimate_k_ipsi(
             raise ValueError(f"H must be [N,T,rep] or [rep,N,T], got {H_arr.shape}")
 
         if np.any(~np.isfinite(H_full[observed])):
-            raise ValueError("H must be finite at every observed sequence step.")
+            raise ValueError("H must be finite at every observed segment.")
         H_full = np.where(observed[:, :, None], H_full, 0.0).astype(np.float32)
 
     C_time_full: Optional[np.ndarray] = None
@@ -2257,7 +2894,7 @@ def estimate_k_ipsi(
             else:
                 raise ValueError(f"C must be [N,T,C] or [C,N,T]; got {C_arr.shape}")
             if np.any(~np.isfinite(C_time_full[observed])):
-                raise ValueError("C must be finite at every observed sequence step.")
+                raise ValueError("C must be finite at every observed segment.")
             C_time_full = np.where(
                 observed[:, :, None], C_time_full, 0.0
             ).astype(np.float32)
@@ -2265,7 +2902,7 @@ def estimate_k_ipsi(
         elif C_arr.ndim == 2:
             if C_arr.shape == (n, T_max):
                 if np.any(~np.isfinite(C_arr[observed])):
-                    raise ValueError("C must be finite at every observed sequence step.")
+                    raise ValueError("C must be finite at every observed segment.")
                 C_time_full = np.where(observed, C_arr, 0.0).astype(np.float32)
             elif C_arr.shape[0] == n:
                 C_static_full = C_arr
@@ -2283,9 +2920,9 @@ def estimate_k_ipsi(
     for split in split_iter:
         if verbose:
             if sample_split_only:
-                print(f"\n{'='*60}\nSample-split held-out fold {split}/{nsplits}\n{'='*60}")
+                print(f"\n{'='*60}\nSample-split held-out fold {split}/{K}\n{'='*60}")
             else:
-                print(f"\n{'='*60}\nFold {split}/{nsplits}\n{'='*60}")
+                print(f"\n{'='*60}\nFold {split}/{K}\n{'='*60}")
 
         train_idx = np.where(s != split)[0]
         test_idx = np.where(s == split)[0]
