@@ -2089,7 +2089,9 @@ def estimate_k_ipsi(
         Binary treatment history ``[N,T]``. Finite 0/1 entries are observed;
         trailing ``NaN`` entries are padding and determine the sequence mask.
     Y : np.ndarray
-        One scalar outcome per unit, shape ``[N]`` or ``[N,1]``.
+        One scalar outcome per unit, shape ``[N]`` or ``[N,1]``, or repeated
+        outcomes ``[N,T]``. For repeated outcomes, column ``s`` is estimated
+        using eligible units and histories through segment ``s`` only.
     delta_seq : array-like
         Positive intervention odds multipliers. Supply a scalar or ``[J]`` to
         apply each multiplier at every observed segment, or ``[J,T]`` for
@@ -2168,6 +2170,8 @@ def estimate_k_ipsi(
     n_boot : int, default=0
         Number of Rademacher multiplier-bootstrap draws. A positive value adds
         simultaneous 95% bands ``ll2`` and ``ul2``; both are ``None`` at zero.
+        With repeated outcomes, the bands are simultaneous over outcome
+        segments for each intervention.
     R_video : np.ndarray, optional
         Aligned video representations ``[N,T,D,H,W]`` or
         ``[N,T,C_video,D,H,W]``. Here ``T`` is the common padded number of
@@ -2191,11 +2195,12 @@ def estimate_k_ipsi(
     Returns
     -------
     dict
-        ``est`` and ``se`` contain the estimated curve and standard errors;
-        ``ll1``/``ul1`` are pointwise 95% intervals; ``ll2``/``ul2`` are
-        simultaneous 95% bands when requested; ``ifvals`` is the ``[N,J]``
-        influence-function matrix. The dictionary also contains ``delta``,
-        expanded ``delta_paths``, ``sigma``, and ``n_eff``.
+        For a scalar outcome, ``est``, ``sigma``, ``se``, and interval arrays
+        have shape ``[J]``, ``ifvals`` has shape ``[N,J]``, and ``n_eff`` is an
+        integer. For repeated outcomes, these arrays have shape ``[T,J]``,
+        ``ifvals`` has shape ``[N,T,J]`` (with ``NaN`` for units not estimated),
+        and ``n_eff`` has shape ``[T]``. The dictionary also contains
+        ``delta`` and expanded ``delta_paths``.
 
     Notes
     -----
@@ -2207,8 +2212,6 @@ def estimate_k_ipsi(
     features, ``D`` equals latent time within a segment and is distinct from
     the outer segment axis ``T``.
     A finite zero in ``W`` is an observed control treatment, not padding.
-    This function supports one scalar outcome per unit; it does not implement
-    inference for repeated outcomes shaped ``[N,T]``.
     """
 
     architecture_y = tuple(int(width) for width in architecture_y)
@@ -2245,6 +2248,250 @@ def estimate_k_ipsi(
 
     if model_dir is not None and model_dir != "" and not os.path.exists(model_dir):
         raise ValueError(f"model_dir does not exist: {model_dir}")
+
+    Y_input = np.asarray(Y, dtype=np.float32)
+    W_input = np.asarray(W, dtype=np.float32)
+    repeated_y = (
+        Y_input.ndim == 2
+        and W_input.ndim == 2
+        and Y_input.shape == W_input.shape
+        and Y_input.shape[1] > 1
+    )
+    if repeated_y:
+        _, repeated_mask = _infer_mask_from_w(W_input)
+        n, T_max = repeated_mask.shape
+
+        K_repeated = int(K)
+        if K_repeated < 2:
+            raise ValueError("K must be at least 2.")
+
+        delta_arr = np.asarray(delta_seq, dtype=float)
+        if delta_arr.ndim == 0:
+            delta_arr = delta_arr.reshape(1)
+        if delta_arr.ndim == 1:
+            if np.any(~np.isfinite(delta_arr)) or np.any(delta_arr <= 0):
+                raise ValueError("delta_seq must be finite and >0.")
+            delta_paths = np.tile(delta_arr.reshape(-1, 1), (1, T_max))
+            delta_out = delta_arr
+        elif delta_arr.ndim == 2:
+            if delta_arr.shape[1] != T_max:
+                raise ValueError(
+                    f"delta_seq 2D must be [J,T_max={T_max}], got "
+                    f"{delta_arr.shape}"
+                )
+            if np.any(~np.isfinite(delta_arr)) or np.any(delta_arr <= 0):
+                raise ValueError("delta_seq must be finite and >0.")
+            delta_paths = delta_arr
+            delta_out = delta_arr
+        else:
+            raise ValueError("delta_seq must be scalar, 1D (J,), or 2D (J,T).")
+
+        def _slice_R(valid: np.ndarray, stop: int) -> np.ndarray:
+            R_input = np.asarray(R)
+            if R_input.ndim != 3:
+                raise ValueError(f"R must be 3D, got {R_input.shape}")
+            if R_input.shape[:2] == (n, T_max):
+                return R_input[valid, :stop, :]
+            if R_input.shape[1:] == (n, T_max):
+                return R_input[:, valid, :stop]
+            raise ValueError(
+                f"R must be [N,T,F] or [F,N,T] with N={n}, T={T_max}; "
+                f"got {R_input.shape}"
+            )
+
+        def _slice_H(valid: np.ndarray, stop: int) -> Optional[np.ndarray]:
+            if H is None:
+                return None
+            H_input = np.asarray(H)
+            if H_input.ndim != 3:
+                raise ValueError(f"H must be 3D, got {H_input.shape}")
+            if H_input.shape[:2] == (n, T_max):
+                return H_input[valid, :stop, :]
+            if H_input.shape[1:] == (n, T_max):
+                return H_input[:, valid, :stop]
+            raise ValueError(
+                f"H must be [N,T,rep] or [rep,N,T], got {H_input.shape}"
+            )
+
+        def _slice_C(valid: np.ndarray, stop: int) -> Optional[np.ndarray]:
+            if C is None:
+                return None
+            C_input = np.asarray(C)
+            if C_input.ndim == 3:
+                if C_input.shape[:2] == (n, T_max):
+                    return C_input[valid, :stop, :]
+                if C_input.shape[1:] == (n, T_max):
+                    return C_input[:, valid, :stop]
+                raise ValueError(
+                    f"C must be [N,T,C] or [C,N,T]; got {C_input.shape}"
+                )
+            if C_input.ndim == 2:
+                if C_input.shape == (n, T_max):
+                    return C_input[valid, :stop]
+                if C_input.shape[0] == n:
+                    return C_input[valid, :]
+                raise ValueError(
+                    f"C must be [N,T] or [N,C]; got {C_input.shape}"
+                )
+            if C_input.ndim == 1 and C_input.shape[0] == n:
+                return C_input[valid]
+            raise ValueError("C must be 1D, 2D, or 3D and have first unit axis N.")
+
+        def _slice_video(valid: np.ndarray, stop: int) -> Optional[np.ndarray]:
+            if R_video is None:
+                return None
+            video_input = np.asarray(R_video)
+            if video_input.ndim not in (5, 6) or video_input.shape[:2] != (
+                n,
+                T_max,
+            ):
+                raise ValueError(
+                    "R_video must be [N,T,C_video,D,H,W] or [N,T,D,H,W]; "
+                    f"got {video_input.shape}"
+                )
+            return video_input[valid, :stop, ...]
+
+        n_interventions = int(delta_paths.shape[0])
+        segment_results: list[Dict[str, Any]] = []
+        repeated_ifvals = np.full(
+            (n, T_max, n_interventions), np.nan, dtype=float
+        )
+
+        for outcome_segment in range(T_max):
+            stop = outcome_segment + 1
+            valid = (repeated_mask[:, outcome_segment] > 0) & np.isfinite(
+                Y_input[:, outcome_segment]
+            )
+            n_segment = int(np.sum(valid))
+            if n_segment < K_repeated:
+                raise ValueError(
+                    f"Outcome segment {stop} has {n_segment} eligible units, "
+                    f"fewer than K={K_repeated}."
+                )
+            if verbose:
+                print(
+                    f"\n{'#' * 60}\nOutcome segment {stop}/{T_max}: "
+                    f"n={n_segment}\n{'#' * 60}"
+                )
+
+            segment_model_dir = None
+            if model_dir:
+                segment_model_dir = os.path.join(model_dir, f"segment{stop}")
+                os.makedirs(segment_model_dir, exist_ok=True)
+
+            segment_delta = (
+                delta_arr[:, :stop] if delta_arr.ndim == 2 else delta_arr
+            )
+            segment_result = estimate_k_ipsi(
+                R=_slice_R(valid, stop),
+                W=W_input[valid, :stop],
+                Y=Y_input[valid, outcome_segment],
+                delta_seq=segment_delta,
+                K=K,
+                sample_split_only=sample_split_only,
+                sample_split_fold=sample_split_fold,
+                architecture_y=architecture_y,
+                architecture_z=architecture_z,
+                nepoch=nepoch,
+                batch_size=batch_size,
+                lr=lr,
+                dropout=dropout,
+                valid_perc=valid_perc,
+                step_size=step_size,
+                bn=bn,
+                patience=patience,
+                min_delta=min_delta,
+                verbose=verbose,
+                random_state=random_state + outcome_segment,
+                eps_prob=eps_prob,
+                nn_hidden=nn_hidden,
+                nn_alpha=nn_alpha,
+                nn_lr=nn_lr,
+                nn_lr_scheduler=nn_lr_scheduler,
+                nn_lr_scheduler_factor=nn_lr_scheduler_factor,
+                nn_lr_scheduler_patience=nn_lr_scheduler_patience,
+                nn_lr_scheduler_min_lr=nn_lr_scheduler_min_lr,
+                nn_max_iter=nn_max_iter,
+                nn_patience=nn_patience,
+                nn_batch_size=nn_batch_size,
+                nn_dropout=nn_dropout,
+                H=_slice_H(valid, stop),
+                C=_slice_C(valid, stop),
+                model_dir=segment_model_dir,
+                device=device,
+                n_boot=0,
+                R_video=_slice_video(valid, stop),
+                text_input_dim=text_input_dim,
+                text_hidden_dims=text_hidden_dims,
+                text_out_dim=text_out_dim,
+                video_in_channels=video_in_channels,
+                video_channels=video_channels,
+                video_out_dim=video_out_dim,
+            )
+            segment_results.append(segment_result)
+            repeated_ifvals[valid, outcome_segment, :] = segment_result["ifvals"]
+
+        repeated_out = {
+            key: np.stack([result[key] for result in segment_results], axis=0)
+            for key in ("est", "sigma", "se", "ll1", "ul1")
+        }
+        repeated_out["ifvals"] = repeated_ifvals
+        repeated_out["n_eff"] = np.asarray(
+            [result["n_eff"] for result in segment_results], dtype=int
+        )
+
+        ll2 = None
+        ul2 = None
+        if n_boot > 0:
+            maxima = np.zeros((n_boot, n_interventions), dtype=float)
+            bootstrap_rng = np.random.default_rng(random_state)
+            boot_batch_size = max(1, min(n_boot, 1_000_000 // max(n, 1)))
+            for start in range(0, n_boot, boot_batch_size):
+                stop = min(start + boot_batch_size, n_boot)
+                multipliers = bootstrap_rng.choice(
+                    (-1.0, 1.0), size=(stop - start, n)
+                )
+                batch_maxima = np.zeros(
+                    (stop - start, n_interventions), dtype=float
+                )
+                for outcome_segment in range(T_max):
+                    scores = repeated_ifvals[:, outcome_segment, :]
+                    estimation_units = np.all(np.isfinite(scores), axis=1)
+                    n_eff_segment = int(repeated_out["n_eff"][outcome_segment])
+                    if int(np.sum(estimation_units)) != n_eff_segment:
+                        raise RuntimeError(
+                            "Uniform confidence bands require finite influence-"
+                            "function values for every estimated unit and delta."
+                        )
+                    centered_scores = scores[estimation_units] - repeated_out[
+                        "est"
+                    ][outcome_segment]
+                    sigma_segment = repeated_out["sigma"][outcome_segment]
+                    active = sigma_segment > 0
+                    if np.any(active):
+                        process = (
+                            multipliers[:, estimation_units]
+                            @ centered_scores[:, active]
+                        )
+                        process /= (
+                            np.sqrt(n_eff_segment) * sigma_segment[active]
+                        )
+                        batch_maxima[:, active] = np.maximum(
+                            batch_maxima[:, active], np.abs(process)
+                        )
+                maxima[start:stop] = batch_maxima
+
+            critical_values = np.quantile(maxima, 0.95, axis=0)
+            ll2 = repeated_out["est"] - critical_values * repeated_out["se"]
+            ul2 = repeated_out["est"] + critical_values * repeated_out["se"]
+
+        return {
+            "delta": np.array(delta_out, dtype=float),
+            "delta_paths": np.array(delta_paths, dtype=float),
+            **repeated_out,
+            "ll2": ll2,
+            "ul2": ul2,
+        }
 
     def _train_tarnet(
         R_sub: np.ndarray,
@@ -2750,8 +2997,8 @@ def estimate_k_ipsi(
 
         return psi_vals
 
-    W_arr, mask_arr = _infer_mask_from_w(W)
-    Y_arr = np.asarray(Y, dtype=np.float32).reshape(-1)
+    W_arr, mask_arr = _infer_mask_from_w(W_input)
+    Y_arr = Y_input.reshape(-1)
 
     n, T_max = W_arr.shape
 

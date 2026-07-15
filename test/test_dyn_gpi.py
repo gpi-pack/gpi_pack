@@ -369,6 +369,158 @@ def test_estimator_uses_one_pipeline_for_vector_and_multimodal_inputs(monkeypatc
     np.testing.assert_array_equal(zero_variance["ul2"], zero_variance["est"])
 
 
+def test_estimator_runs_repeated_outcomes_on_segment_prefixes(monkeypatch):
+    class DummyClassifier:
+        classes_ = np.array([0, 1])
+
+        def predict_proba(self, x):
+            return np.full((len(x), 2), 0.5, dtype=np.float32)
+
+    class DummyRegressor:
+        def predict(self, x):
+            return np.zeros(len(x), dtype=np.float32)
+
+    monkeypatch.setattr(
+        dyn_gpi, "_fit_downstream_classifier", lambda **kwargs: DummyClassifier()
+    )
+    monkeypatch.setattr(
+        dyn_gpi, "_fit_downstream_regressor", lambda **kwargs: DummyRegressor()
+    )
+
+    rng = np.random.default_rng(29)
+    n, t = 10, 3
+    mask = np.zeros((n, t), dtype=bool)
+    lengths = np.array([3, 3, 3, 3, 3, 3, 3, 2, 2, 1])
+    for i, length in enumerate(lengths):
+        mask[i, :length] = True
+
+    w_complete = rng.integers(0, 2, size=(n, t)).astype(float)
+    w = np.where(mask, w_complete, np.nan)
+    r = rng.normal(size=(n, t, 2)).astype(np.float32)
+    h = rng.normal(size=(n, t, 2)).astype(np.float32)
+    c = rng.normal(size=(n, t, 1)).astype(np.float32)
+    video = rng.normal(size=(n, t, 2, 2, 2)).astype(np.float32)
+    r[~mask] = np.nan
+    h[~mask] = np.nan
+    c[~mask] = np.nan
+    video[~mask] = np.nan
+
+    y = rng.normal(size=(n, t)).astype(np.float32)
+    y[~mask] = np.nan
+    y[1, 1] = np.nan
+    delta = np.array([[0.5, 0.75, 1.0], [2.0, 1.5, 1.25]])
+    n_boot = 32
+    base_seed = 17
+
+    repeated = dyn_gpi.estimate_k_ipsi(
+        R=r,
+        R_video=video,
+        W=w,
+        Y=y,
+        delta_seq=delta,
+        K=2,
+        H=h,
+        C=c,
+        verbose=False,
+        device="cpu",
+        n_boot=n_boot,
+        random_state=base_seed,
+    )
+
+    assert repeated["est"].shape == (t, len(delta))
+    assert repeated["ifvals"].shape == (n, t, len(delta))
+    assert repeated["n_eff"].shape == (t,)
+    assert repeated["ll2"].shape == repeated["ul2"].shape == repeated["est"].shape
+    np.testing.assert_array_equal(repeated["delta"], delta)
+    np.testing.assert_array_equal(repeated["delta_paths"], delta)
+
+    scalar_results = []
+    for outcome_segment in range(t):
+        stop = outcome_segment + 1
+        valid = mask[:, outcome_segment] & np.isfinite(y[:, outcome_segment])
+        scalar = dyn_gpi.estimate_k_ipsi(
+            R=r[valid, :stop],
+            R_video=video[valid, :stop],
+            W=w[valid, :stop],
+            Y=y[valid, outcome_segment],
+            delta_seq=delta[:, :stop],
+            K=2,
+            H=h[valid, :stop],
+            C=c[valid, :stop],
+            verbose=False,
+            device="cpu",
+            random_state=base_seed + outcome_segment,
+        )
+        scalar_results.append(scalar)
+        for key in ("est", "sigma", "se", "ll1", "ul1"):
+            np.testing.assert_allclose(repeated[key][outcome_segment], scalar[key])
+        np.testing.assert_allclose(
+            repeated["ifvals"][valid, outcome_segment], scalar["ifvals"]
+        )
+        assert np.all(np.isnan(repeated["ifvals"][~valid, outcome_segment]))
+        assert repeated["n_eff"][outcome_segment] == scalar["n_eff"]
+
+    valid_first = mask[:, 0] & np.isfinite(y[:, 0])
+    scalar_column = dyn_gpi.estimate_k_ipsi(
+        R=r[valid_first, :1],
+        R_video=video[valid_first, :1],
+        W=w[valid_first, :1],
+        Y=y[valid_first, :1],
+        delta_seq=delta[:, :1],
+        K=2,
+        H=h[valid_first, :1],
+        C=c[valid_first, :1],
+        verbose=False,
+        device="cpu",
+        random_state=base_seed,
+    )
+    for key in ("est", "sigma", "se", "ll1", "ul1", "ifvals"):
+        np.testing.assert_allclose(scalar_column[key], scalar_results[0][key])
+    assert scalar_column["est"].shape == (len(delta),)
+    assert isinstance(scalar_column["n_eff"], int)
+
+    feature_first = dyn_gpi.estimate_k_ipsi(
+        R=np.transpose(r, (2, 0, 1)),
+        R_video=video,
+        W=w,
+        Y=y,
+        delta_seq=delta,
+        K=2,
+        H=np.transpose(h, (2, 0, 1)),
+        C=np.transpose(c, (2, 0, 1)),
+        verbose=False,
+        device="cpu",
+        random_state=base_seed,
+    )
+    for key in ("est", "sigma", "se", "ll1", "ul1", "ifvals", "n_eff"):
+        np.testing.assert_allclose(feature_first[key], repeated[key])
+    assert feature_first["ll2"] is None
+    assert feature_first["ul2"] is None
+
+    multipliers = np.random.default_rng(base_seed).choice(
+        (-1.0, 1.0), size=(n_boot, n)
+    )
+    maxima = np.zeros((n_boot, len(delta)))
+    for outcome_segment in range(t):
+        scores = repeated["ifvals"][:, outcome_segment]
+        valid = np.all(np.isfinite(scores), axis=1)
+        centered = scores[valid] - repeated["est"][outcome_segment]
+        active = repeated["sigma"][outcome_segment] > 0
+        process = multipliers[:, valid] @ centered[:, active]
+        process /= (
+            np.sqrt(repeated["n_eff"][outcome_segment])
+            * repeated["sigma"][outcome_segment, active]
+        )
+        maxima[:, active] = np.maximum(maxima[:, active], np.abs(process))
+    critical_values = np.quantile(maxima, 0.95, axis=0)
+    np.testing.assert_allclose(
+        repeated["ll2"], repeated["est"] - critical_values * repeated["se"]
+    )
+    np.testing.assert_allclose(
+        repeated["ul2"], repeated["est"] + critical_values * repeated["se"]
+    )
+
+
 def test_estimator_infers_multimodal_mode_from_video():
     signature = inspect.signature(dyn_gpi.estimate_k_ipsi)
     assert list(signature.parameters)[:4] == ["R", "W", "Y", "delta_seq"]

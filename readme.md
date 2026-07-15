@@ -322,7 +322,8 @@ estimate the incremental-intervention curve. The main inputs are:
   `[N, T, C_video, D, H, W]`.
 - `W`: binary treatments with shape `[N, T]`. Observed values must be `0` or
   `1`, and unused trailing positions must be `NaN`.
-- `Y`: one scalar outcome for each unit, with shape `[N]`.
+- `Y`: one scalar outcome for each unit, with shape `[N]`, or repeated
+  segment outcomes with shape `[N, T]`. Use `NaN` for unavailable outcomes.
 - `C`: optional static covariates `[N, P]` or segment-varying covariates
   `[N, T]` or `[N, T, P]`.
 
@@ -391,20 +392,23 @@ A one-dimensional `delta_seq` evaluates several constant interventions. You
 can instead supply an array with shape `[J, T]` to evaluate `J` segment-specific
 intervention schedules.
 
-`result["est"]` and `result["se"]` contain the estimate and standard error for
-each intervention. `ll1` and `ul1` are pointwise 95% confidence intervals.
-Setting `n_boot` to a positive integer additionally calculates 95% Rademacher
-multiplier-bootstrap bands in `ll2` and `ul2`, simultaneous over the supplied
-intervention grid. With the default `n_boot=0`, `ll2` and `ul2` are `None`.
-The returned `ifvals` array contains the unit-level influence-function values,
-and `n_eff` is the number of units used for inference.
+For scalar `Y`, `result["est"]` and `result["se"]` have shape `[J]`, and
+`ifvals` has shape `[N, J]`. For repeated `Y`, the estimator runs once for each
+outcome segment `s`, using only units observed at `s` and histories through
+`s`. The corresponding shapes are `[T, J]` for estimates and intervals,
+`[N, T, J]` for `ifvals`, and `[T]` for `n_eff`; ineligible entries of `ifvals`
+and entries outside a requested held-out fold are `NaN`.
+
+`ll1` and `ul1` are pointwise 95% confidence intervals. Setting `n_boot` to a
+positive integer additionally calculates 95% Rademacher multiplier-bootstrap
+bands in `ll2` and `ul2`. These are simultaneous over the supplied intervention
+grid for scalar `Y`, and over outcome segments separately for each intervention
+when `Y` is repeated. With the default `n_boot=0`, `ll2` and `ul2` are `None`.
 
 Supplying `R_video` automatically enables multimodal estimation. If it is
 omitted, `R` can be supplied as either `[N, T, F]` or `[F, N, T]` for the
 vector-only setup. Both modes use the same cross-fitting, nuisance-estimation,
-and influence-function implementation. This API estimates a scalar-outcome
-estimand (`Y` is `[N]`); it does not implement a repeated outcome trajectory
-with `Y` shaped `[N, T]`.
+and influence-function implementation.
 
 
 ### Hyperparameter Tuning
